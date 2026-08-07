@@ -1,7 +1,8 @@
-﻿// =========================================================
+// =========================================================
 // 五子棋 WASM 棋圣引擎（AssemblyScript）
 // 威胁空间搜索 TSS：VCF/VCT 连杀算杀 + Negamax/Alpha-Beta
 // + Zobrist 置换表 + 杀手启发 + 迭代加深
+// v2：候选数组按层(ply)隔离，彻底杜绝递归覆盖污染
 // =========================================================
 
 const EMPTY: i32 = 0;
@@ -21,13 +22,28 @@ let me: i32 = BLACK;
 let opp: i32 = WHITE;
 
 const board = new Int8Array(MAXN * MAXN);
-
 const DIR8 = new Int32Array(8);
 const DIR8b = new Int32Array(8);
 
 // ---- 节点预算 ----
 let budget: i32 = 100000;
 let nodes: i32 = 0;
+
+// ---- 分层候选（核心修复：每层递归独立存储，互不覆盖） ----
+// 层分配：root=0；search=1+ply(1..17)；vctWinOne=18；vctSearch=19+...；findOppBlock=25
+const MAX_PLY: i32 = 26;
+const CAND_MAX: i32 = 24;
+const CAND_SIZE: i32 = 361;
+const LAYER_VCT1: i32 = 18;
+const LAYER_BLOCK: i32 = 25;
+let candR = new Int16Array(MAX_PLY * CAND_MAX);
+let candC = new Int16Array(MAX_PLY * CAND_MAX);
+let candS = new Int32Array(MAX_PLY * CAND_MAX);
+let candCnt = new Int16Array(MAX_PLY);
+// 采集暂存（仅 genCandidates 内部使用，函数内无递归，安全）
+let tmpR = new Int16Array(CAND_SIZE);
+let tmpC = new Int16Array(CAND_SIZE);
+let tmpS = new Int32Array(CAND_SIZE);
 
 // ---- Zobrist（双 32-bit） ----
 let zTab: Uint32Array = new Uint32Array(0);
@@ -84,12 +100,10 @@ function ttClear(): void {
 // ---- 杀手启发 ----
 let killers = new Int16Array(32);
 
-// ---- 棋型统计（全局暂存，避免分配） ----
+// ---- 棋型统计（全局暂存，调用点均无并发递归读取） ----
 let gFive: i32 = 0, gLive4: i32 = 0, gRush4: i32 = 0, gLive3: i32 = 0, gRush3: i32 = 0;
-// 叶子评估聚合（全局）
 let gS5: i32 = 0, gS4: i32 = 0, gS4r: i32 = 0, gS3: i32 = 0, gS3r: i32 = 0;
 let gO5: i32 = 0, gO4: i32 = 0, gO4r: i32 = 0, gO3: i32 = 0, gO3r: i32 = 0;
-// 线扫描暂存
 let lr = new Int16Array(MAXN);
 let lc = new Int16Array(MAXN);
 
@@ -232,49 +246,37 @@ function compositeEval(r: i32, c: i32, col: i32): i32 {
   return m + ((o * 11) / 10) - ((drr < 0 ? -drr : drr) + (dcc < 0 ? -dcc : dcc));
 }
 
-// ---- 候选生成 ----
-const CAND_SIZE: i32 = 361;
-let candR = new Int16Array(CAND_SIZE);
-let candC = new Int16Array(CAND_SIZE);
-let candS = new Int32Array(CAND_SIZE);
-let candCount: i32 = 0;
-
-function genCandidates(col: i32, composite: boolean, cap: i32): void {
-  candCount = 0;
+// ---- 分层候选生成：结果写入 layer 层，层间完全隔离 ----
+function genCandidates(col: i32, composite: boolean, cap: i32, layer: i32): void {
+  let cnt = 0;
   for (let r = 0; r < N; r++) {
     for (let c = 0; c < N; c++) {
       if (cell(r, c) !== EMPTY) continue;
       if (!hasNeighbor(r, c, 2)) continue;
       const s = composite ? compositeEval(r, c, col) : fastEval(r, c, col);
-      if (candCount < CAND_SIZE) {
-        candR[candCount] = r; candC[candCount] = c; candS[candCount] = s;
-        candCount++;
+      if (cnt < CAND_SIZE) {
+        tmpR[cnt] = r; tmpC[cnt] = c; tmpS[cnt] = s;
+        cnt++;
       }
     }
   }
-  for (let i = 1; i < candCount; i++) {
-    const r = candR[i], c = candC[i], s = candS[i];
+  for (let i = 1; i < cnt; i++) {
+    const r = tmpR[i], c = tmpC[i], s = tmpS[i];
     let j = i - 1;
-    while (j >= 0 && candS[j] < s) {
-      candR[j + 1] = candR[j]; candC[j + 1] = candC[j]; candS[j + 1] = candS[j];
+    while (j >= 0 && tmpS[j] < s) {
+      tmpR[j + 1] = tmpR[j]; tmpC[j + 1] = tmpC[j]; tmpS[j + 1] = tmpS[j];
       j--;
     }
-    candR[j + 1] = r; candC[j + 1] = c; candS[j + 1] = s;
+    tmpR[j + 1] = r; tmpC[j + 1] = c; tmpS[j + 1] = s;
   }
-  if (candCount > cap) candCount = cap;
-}
-
-// 候选快照（递归期间全局候选数组会被覆盖）
-let bakR = new Int16Array(16);
-let bakC = new Int16Array(16);
-let bakS = new Int32Array(16);
-let bakCount: i32 = 0;
-
-function snapCand(): void {
-  bakCount = candCount;
-  for (let i = 0; i < candCount; i++) {
-    bakR[i] = candR[i]; bakC[i] = candC[i]; bakS[i] = candS[i];
+  const lim = cnt < cap ? cnt : cap;
+  const base = layer * CAND_MAX;
+  for (let i = 0; i < lim; i++) {
+    candR[base + i] = tmpR[i];
+    candC[base + i] = tmpC[i];
+    candS[base + i] = tmpS[i];
   }
+  candCnt[layer] = lim;
 }
 
 // ---- 叶子评估（全盘 5 窗口聚合，视角：己方-对方） ----
@@ -362,13 +364,15 @@ function timeout(): boolean {
   return nodes > budget;
 }
 
-// 完成点收集
+// 完成点收集（4 石窗空白 / 3 石窗空白），以及按层快照（递归安全）
 let cpR = new Int16Array(16);
 let cpC = new Int16Array(16);
 let cpCount: i32 = 0;
 let cqR = new Int16Array(16);
 let cqC = new Int16Array(16);
 let cqCount: i32 = 0;
+let cqLayR = new Int16Array(MAX_PLY * 16);
+let cqLayC = new Int16Array(MAX_PLY * 16);
 
 function completionPoints(r: i32, c: i32, col: i32): void {
   cpCount = 0; cqCount = 0;
@@ -401,10 +405,11 @@ function completionPoints(r: i32, c: i32, col: i32): void {
 
 // ---- VCT 单步必杀 / 连续追杀 ----
 function vctWinOne(col: i32): boolean {
-  genCandidates(col, false, 16);
-  for (let i = 0; i < candCount; i++) {
+  genCandidates(col, false, 16, LAYER_VCT1);
+  const base = LAYER_VCT1 * CAND_MAX;
+  for (let i = 0; i < candCnt[LAYER_VCT1]; i++) {
     if (timeout()) return false;
-    const r = candR[i], c = candC[i];
+    const r = candR[base + i], c = candC[base + i];
     place(r, c, col);
     if (checkWinAt(r, c, col)) { gMoveR = r; gMoveC = c; unplace(r, c, col); return true; }
     classifyPoint(r, c, col);
@@ -433,14 +438,15 @@ function vctWinOne(col: i32): boolean {
   return false;
 }
 
-// VCT 递归（连续冲四/活三追杀）
+// VCT 递归（连续冲四/活三追杀）；候选按 plyLeft 分层存储
 function vctSearch(col: i32, plyLeft: i32): boolean {
   if (plyLeft <= 0 || timeout()) return false;
-  genCandidates(col, false, 12);
-  snapCand();
-  for (let i = 0; i < bakCount; i++) {
+  const layer = 19 + (10 - plyLeft) / 2;
+  genCandidates(col, false, 12, layer);
+  const base = layer * CAND_MAX;
+  for (let i = 0; i < candCnt[layer]; i++) {
     if (timeout()) return false;
-    const r = bakR[i], c = bakC[i];
+    const r = candR[base + i], c = candC[base + i];
     place(r, c, col);
     if (checkWinAt(r, c, col)) { gMoveR = r; gMoveC = c; unplace(r, c, col); return true; }
     classifyPoint(r, c, col);
@@ -473,10 +479,17 @@ function vctSearch(col: i32, plyLeft: i32): boolean {
         if (res) { unplace(r, c, col); gMoveR = r; gMoveC = c; return true; }
       }
     } else if (gLive3 >= 1) {
+      // 活三：完成点先快照到本层（递归会重写 cq 全局数组）
       completionPoints(r, c, col);
-      let allWin = cqCount > 0;
-      for (let j = 0; j < cqCount; j++) {
-        const br = cqR[j], bc = cqC[j];
+      const nBlocks = cqCount;
+      const cqBase = layer * 16;
+      for (let j = 0; j < nBlocks; j++) {
+        cqLayR[cqBase + j] = cqR[j];
+        cqLayC[cqBase + j] = cqC[j];
+      }
+      let allWin = nBlocks > 0;
+      for (let j = 0; j < nBlocks; j++) {
+        const br = cqLayR[cqBase + j], bc = cqLayC[cqBase + j];
         place(br, bc, opp);
         if (checkWinAt(br, bc, opp)) { unplace(br, bc, opp); allWin = false; break; }
         const r2 = vctSearch(col, plyLeft - 2);
@@ -505,15 +518,17 @@ function search(depth: i32, alpha: i32, beta: i32, ply: i32): i32 {
     return (ply % 2 === 0) ? s : -s;
   }
   const col = (ply % 2 === 0) ? me : opp;
-  genCandidates(col, false, 12);
+  const layer = 1 + ply;
+  genCandidates(col, false, 12, layer);
+  const base = layer * CAND_MAX;
   // TT 着法 / 杀手提前
   let ttUse = false;
   if (ttKey[ti] === key && ttMr[ti] >= 0) {
-    for (let i = 0; i < candCount; i++) {
-      if (candR[i] === ttMr[ti] && candC[i] === ttMc[ti]) {
-        const r = candR[0], c = candC[0], s = candS[0];
-        candR[0] = candR[i]; candC[0] = candC[i]; candS[0] = candS[i];
-        candR[i] = r; candC[i] = c; candS[i] = s;
+    for (let i = 0; i < candCnt[layer]; i++) {
+      if (candR[base + i] === ttMr[ti] && candC[base + i] === ttMc[ti]) {
+        const r = candR[base], c = candC[base], s = candS[base];
+        candR[base] = candR[base + i]; candC[base] = candC[base + i]; candS[base] = candS[base + i];
+        candR[base + i] = r; candC[base + i] = c; candS[base + i] = s;
         ttUse = true;
         break;
       }
@@ -522,23 +537,22 @@ function search(depth: i32, alpha: i32, beta: i32, ply: i32): i32 {
   if (!ttUse) {
     const kr = killers[ply * 2], kc = killers[ply * 2 + 1];
     if (kr >= 0) {
-      for (let i = 0; i < candCount; i++) {
-        if (candR[i] === kr && candC[i] === kc) {
-          const r = candR[0], c = candC[0], s = candS[0];
-          candR[0] = candR[i]; candC[0] = candC[i]; candS[0] = candS[i];
-          candR[i] = r; candC[i] = c; candS[i] = s;
+      for (let i = 0; i < candCnt[layer]; i++) {
+        if (candR[base + i] === kr && candC[base + i] === kc) {
+          const r = candR[base], c = candC[base], s = candS[base];
+          candR[base] = candR[base + i]; candC[base] = candC[base + i]; candS[base] = candS[base + i];
+          candR[base + i] = r; candC[base + i] = c; candS[base + i] = s;
           break;
         }
       }
     }
   }
-  snapCand();
   let best = -2147483647;
   let bestR: i32 = -1, bestC: i32 = -1;
   let alpha0 = alpha;
-  for (let i = 0; i < bakCount; i++) {
+  for (let i = 0; i < candCnt[layer]; i++) {
     if (timeout()) return 0;
-    const r = bakR[i], c = bakC[i];
+    const r = candR[base + i], c = candC[base + i];
     place(r, c, col);
     let val: i32;
     if (checkWinAt(r, c, col)) {
@@ -566,19 +580,18 @@ function search(depth: i32, alpha: i32, beta: i32, ply: i32): i32 {
   return best;
 }
 
-// ---- 迭代加深根搜索 ----
+// ---- 迭代加深根搜索（层 0，子搜索从层 1 起，互不干扰） ----
 function searchRoot(maxDepth: i32): boolean {
   let bestR: i32 = -1, bestC: i32 = -1;
   for (let d = 1; d <= maxDepth; d++) {
     if (timeout()) break;
-    genCandidates(me, true, 14);
-    snapCand();
+    genCandidates(me, true, 14, 0);
     let alpha = -2147483647;
     let beta = 2147483647;
     let bmR: i32 = -1, bmC: i32 = -1;
     let bv = -2147483647;
-    for (let i = 0; i < bakCount; i++) {
-      const r = bakR[i], c = bakC[i];
+    for (let i = 0; i < candCnt[0]; i++) {
+      const r = candR[i], c = candC[i];
       place(r, c, me);
       let val: i32;
       if (checkWinAt(r, c, me)) val = WIN_BASE;
@@ -596,40 +609,47 @@ function searchRoot(maxDepth: i32): boolean {
   return false;
 }
 
-// ---- 对手威胁防守 ----
+// ---- 对手威胁强制防守（五连/组合杀/冲四/活三 全部覆盖） ----
 function findOppBlock(): boolean {
-  genCandidates(opp, false, 16);
-  snapCand();
+  genCandidates(opp, false, 16, LAYER_BLOCK);
+  const base = LAYER_BLOCK * CAND_MAX;
   let found = false;
   let bR: i32 = -1, bC: i32 = -1;
   let bestScore = -2147483647;
-  for (let i = 0; i < bakCount; i++) {
+  for (let i = 0; i < candCnt[LAYER_BLOCK]; i++) {
     if (timeout()) return false;
-    const r = bakR[i], c = bakC[i];
+    const r = candR[base + i], c = candC[base + i];
     place(r, c, opp);
     const win = checkWinAt(r, c, opp);
     classifyPoint(r, c, opp);
-    const dbl = isDoubleThreat();
-    unplace(r, c, opp);
-    if (!win && !dbl) continue;
-    place(r, c, me);
-    let s = checkWinAt(r, c, me) ? WIN_BASE : evalLeaf();
-    unplace(r, c, me);
-    if (s > bestScore) { bestScore = s; bR = r; bC = c; found = true; }
-    place(r, c, opp);
+    // 覆盖全部威胁：五连 / 活四 / 双三 / 三四 / 双四 / 单冲四 / 单活三
+    const isThreat = win || gLive4 >= 1 || gRush4 >= 2 || (gRush4 >= 1 && gLive3 >= 1) ||
+                     gLive3 >= 2 || gRush4 >= 1 || gLive3 >= 1;
+    // 在对手已落子状态下收集完成点
     completionPoints(r, c, opp);
     unplace(r, c, opp);
-    for (let j = 0; j < cpCount; j++) {
+    if (!isThreat) continue;
+
+    // 防守点集合：对手落点本身 + 四完成点 + 三完成点（递归内无此循环，快照全局即可）
+    const cpN = cpCount, cqN = cqCount;
+    // 1) 对手落点本身（先手堵死）
+    place(r, c, me);
+    let s0 = checkWinAt(r, c, me) ? WIN_BASE : evalLeaf();
+    unplace(r, c, me);
+    if (s0 > bestScore) { bestScore = s0; bR = r; bC = c; found = true; }
+    // 2) 冲四完成点
+    for (let j = 0; j < cpN; j++) {
       place(cpR[j], cpC[j], me);
-      let s2 = checkWinAt(cpR[j], cpC[j], me) ? WIN_BASE : evalLeaf();
+      let s = checkWinAt(cpR[j], cpC[j], me) ? WIN_BASE : evalLeaf();
       unplace(cpR[j], cpC[j], me);
-      if (s2 > bestScore) { bestScore = s2; bR = cpR[j]; bC = cpC[j]; found = true; }
+      if (s > bestScore) { bestScore = s; bR = cpR[j]; bC = cpC[j]; found = true; }
     }
-    for (let j = 0; j < cqCount; j++) {
+    // 3) 活三完成点
+    for (let j = 0; j < cqN; j++) {
       place(cqR[j], cqC[j], me);
-      let s2 = checkWinAt(cqR[j], cqC[j], me) ? WIN_BASE : evalLeaf();
+      let s = checkWinAt(cqR[j], cqC[j], me) ? WIN_BASE : evalLeaf();
       unplace(cqR[j], cqC[j], me);
-      if (s2 > bestScore) { bestScore = s2; bR = cqR[j]; bC = cqC[j]; found = true; }
+      if (s > bestScore) { bestScore = s; bR = cqR[j]; bC = cqC[j]; found = true; }
     }
   }
   if (found) { gMoveR = bR; gMoveC = bC; return true; }
@@ -691,7 +711,7 @@ export function think(col: i32, nodeBudget: i32): i32 {
   if (vctWinOne(me)) return 1;
   // 2) VCT 连续追杀
   if (vctSearch(me, 10)) return 1;
-  // 3) 防守对手威胁
+  // 3) 对手威胁强制防守（含单活三/冲四）
   if (findOppBlock()) return 1;
   // 4) 迭代加深
   if (timeout()) return 0;

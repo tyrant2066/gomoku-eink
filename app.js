@@ -882,7 +882,10 @@
         const win = checkWin(this.board, this.n, r, c) === colorOpp;
         const t = win ? { five: 1, live4: 0, rush4: 0, live3: 0, rush3: 0 } : classifyPointAt(this.board, this.n, r, c, colorOpp);
         this.unplace(r, c, colorOpp);
-        if (win || isDoubleThreat(t)) return { point: [r, c], win: win, t: t };
+        // 覆盖全部威胁：五连 / 活四 / 双三 / 三四 / 双四 / 单冲四 / 单活三（一律强制防守）
+        if (win || isDoubleThreat(t) || t.rush4 >= 1 || t.live3 >= 1) {
+          return { point: [r, c], win: win, t: t };
+        }
       }
       return null;
     },
