@@ -250,6 +250,17 @@ canvas#board {
   background: var(--fg);
   color: #fff;
 }
+.seg.disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+/* 设置面板提示行 */
+.hint {
+  margin-top: 6px;
+  font-size: 15px;
+  color: #333;
+  text-align: center;
+}
 .switch-label {
   display: flex;
   align-items: center;

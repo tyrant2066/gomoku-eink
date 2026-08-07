@@ -5,6 +5,11 @@
   <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>高智商人机五子棋</title>
   <link rel="stylesheet" href="style.css">
+  <script>
+    // 预检测 WASM 支持（供设置面板决定是否启用"WASM 棋圣"引擎选项）
+    window.__wasmOk = typeof WebAssembly !== "undefined" &&
+      typeof WebAssembly.instantiate === "function";
+  </script>
 </head>
 <body>
   <div id="app">
