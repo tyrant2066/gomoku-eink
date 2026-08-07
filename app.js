@@ -1,4 +1,4 @@
-/* =========================================================
+﻿/* =========================================================
    高智商人机五子棋 - 游戏逻辑 + AI 引擎
    零依赖纯前端实现
    ========================================================= */
@@ -16,13 +16,13 @@
     large: { n: 19, label: "大 · 19×19" }
   };
 
-  // 难度配置
+  // 难度配置（迭代加深深度 / 候选上限 / VCT 连杀追杀深度）
   const dificultades = {
-    1: { depth: 1,  vcf: false, cap: 6,  label: "新手入门" },
-    2: { depth: 2,  vcf: true,  cap: 8,  label: "进阶" },
-    3: { depth: 3,  vcf: true,  cap: 10, label: "高手" },
-    4: { depth: 3,  vcf: true,  cap: 12, label: "大师" },
-    5: { depth: 4,  vcf: true,  cap: 12, label: "棋圣 · 必杀" }
+    1: { depth: 2,  cap: 8,  vct: false, vctPly: 0,  label: "新手入门" },
+    2: { depth: 3,  cap: 10, vct: true,  vctPly: 4,  label: "进阶" },
+    3: { depth: 4,  cap: 12, vct: true,  vctPly: 6,  label: "高手" },
+    4: { depth: 5,  cap: 14, vct: true,  vctPly: 8,  label: "大师" },
+    5: { depth: 6,  cap: 16, vct: true,  vctPly: 10, label: "棋圣 · 必杀" }
   };
 
   /* ---------------- DOM ---------------- */
@@ -329,149 +329,214 @@
     return true;
   }
 
-  /* ---------------- AI 引擎 ---------------- */
+  /* ---------------- AI 引擎（重构版：组合杀招 + Zobrist置换表 + 迭代加深 + VCT算杀） ---------------- */
+
+  // ---- 棋型常量 ----
+  const PT = { FIVE: 8, LIVE4: 7, RUSH4: 6, LIVE3: 5, RUSH3: 4, LIVE2: 3, RUSH2: 2, NONE: 0 };
+  const WIN_BASE = 1000000000;           // 五连必胜分（大于任何评估值）
+
+  // ---- 确定性 PRNG（生成 Zobrist 表） ----
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---- 威胁分类（5 格窗口法）：评估在 (r,c) 落 color 后某方向的棋型 ----
+  function classifyDirection(board, n, r, c, dr, dc, color) {
+    let wins = 0;
+    const fourPts = new Set();
+    const threePts = new Set();
+    for (let s = -4; s <= 0; s++) {
+      let cnt = 0;
+      const empties = [];
+      let inb = true;
+      for (let i = 0; i < 5; i++) {
+        const rr = r + (s + i) * dr, cc = c + (s + i) * dc;
+        if (rr < 0 || rr >= n || cc < 0 || cc >= n) { inb = false; break; }
+        const v = board[rr][cc];
+        if (v === color) cnt++;
+        else if (v === EMPTY) empties.push(rr + "|" + cc);
+      }
+      if (!inb) continue;
+      if (cnt === 5) wins++;
+      else if (cnt === 4 && empties.length === 1) fourPts.add(empties[0]);
+      else if (cnt === 3) empties.forEach(function (e) { threePts.add(e); });
+    }
+    if (wins > 0) return PT.FIVE;
+    if (fourPts.size >= 2) return PT.LIVE4;
+    if (fourPts.size === 1) return PT.RUSH4;
+    if (threePts.size >= 2) return PT.LIVE3;
+    if (threePts.size === 1) return PT.RUSH3;
+    return PT.NONE;
+  }
+
+  // ---- 统计 (r,c) 落 color 后的整体威胁（四方向合计） ----
+  function classifyPointAt(board, n, r, c, color) {
+    const res = { five: 0, live4: 0, rush4: 0, live3: 0, rush3: 0 };
+    for (let k = 0; k < 4; k++) {
+      const t = classifyDirection(board, n, r, c, DIRS[k][0], DIRS[k][1], color);
+      if (t === PT.FIVE) res.five++;
+      else if (t === PT.LIVE4) res.live4++;
+      else if (t === PT.RUSH4) res.rush4++;
+      else if (t === PT.LIVE3) res.live3++;
+      else if (t === PT.RUSH3) res.rush3++;
+    }
+    return res;
+  }
+
+  // ---- 组合威胁判定：双三 / 三四 / 双四 / 活四 / 五连 ----
+  function isDoubleThreat(t) {
+    return t.five > 0 || t.live4 > 0 || t.rush4 >= 2 || (t.rush4 >= 1 && t.live3 >= 1) || t.live3 >= 2;
+  }
+
+  // ---- 威胁价值（组合杀招赋予接近必胜的极高权重 ~5,000,000） ----
+  function threatValue(t) {
+    if (t.five > 0) return 100000000;
+    if (t.live4 > 0) return 10000000;
+    let base = t.rush4 * 1000000 + t.live3 * 100000 + t.rush3 * 10000;
+    if (t.rush4 >= 2 || (t.rush4 >= 1 && t.live3 >= 1) || t.live3 >= 2) base += 5000000;
+    return base;
+  }
+
   const AI = {
     board: null, n: 0, me: 0, opp: 0, renju: false,
 
-    // 候选点评估简化表
-    EVAL_TABLE: null,
+    // 时间预算
+    deadline: 0, nodes: 0,
 
-    // 主入口：返回 [row, col]
+    // Zobrist 置换表
+    zTable: null, zHi: 0, zLo: 0, tt: null,
+
+    // 杀手启发
+    killers: [],
+
+    // ---- 主入口：返回 [row, col] ----
     bestMove(b, n, me, renju, opponent_last) {
       this.board = b; this.n = n; this.me = me; this.opp = me === BLACK ? WHITE : BLACK; this.renju = renju;
       const cfg = dificultades[state.difficulty] || dificultades[3];
 
-      // 空盘/首手：下天元（仅在棋盘近乎全空时）
       const stones = this.countStones();
-      if (stones === 0) {
-        return [Math.floor(n / 2), Math.floor(n / 2)];
-      }
-      // 第二手：贴近第一手
+      if (stones === 0) return [Math.floor(n / 2), Math.floor(n / 2)];
       if (stones === 1) {
         const first = this.findFirstStone();
         if (first) return this.near(first.row, first.col);
       }
 
-      const candidates = this.genCandidates(me, cfg);
+      // 前段预算（VCT 算杀 / 防守探测）：用完立即释放，保证主搜索有充足时间
+      this.resetSearch(80);
+      this.zobInit();   // place()/unplace() 需要 Zobrist 表（幂等，仅初始化一次）
 
-      // 先做即时胜负
-      for (const [r, c] of candidates) {
-        this.board[r][c] = me;
-        const win = checkWin(this.board, n, r, c);
-        this.board[r][c] = EMPTY;
-        if (win === me) return [r, c];
-      }
-      // 防守对方即时胜
-      const opp = this.opp;
-      for (const [r, c] of candidates) {
-        this.board[r][c] = opp;
-        const win = checkWin(this.board, n, r, c);
-        this.board[r][c] = EMPTY;
-        if (win === opp) return [r, c];
-      }
+      // 1) 单步必杀：直接五连 或 一步组合杀（双三/三四/双四/活四）
+      const one = this.vctWinOne(me);
+      if (one) return one;
 
-      // VCF / VCT 连杀（难度>=2 开启，作为提速捷径）
-      if (cfg.vcf) {
-        const kill = this.vcfSearch(me, 2);
+      // 2) VCT 连续追杀（难度 >=2 开启）：递归“连续冲四/活三”强制五连
+      if (cfg.vct) {
+        const kill = this.vct(me, cfg.vctPly);
         if (kill) return kill;
-        if (cfg.depth >= 4) {
-          const block = this.vcfSearch(opp, 1);
-          if (block) return this.findVcfDefense(block);
-        }
       }
 
-      // 递归搜索（根节点选最优，带时间/节点预算）
-      this.beginSearch();
-      const rootMoves = candidates;
-      let alpha = -Infinity, beta = Infinity;
-      let bestMove = rootMoves[0] || [Math.floor(n/2), Math.floor(n/2)];
-      let bestVal = -Infinity;
-      for (const [r, c] of rootMoves) {
-        this.board[r][c] = me;
-        let val;
-        const win = checkWin(this.board, n, r, c);
-        if (win === me) {
-          val = 10000000 + cfg.depth;
-        } else {
-          val = -this.negamaxTrack(rootMoves, cfg, -beta, -alpha, 1, me);
-        }
-        this.board[r][c] = EMPTY;
-        if (this.nodeBudget <= 0) {
-          // 预算耗尽：提前利用已展开的首个候选结束
-          break;
-        }
-        if (val > bestVal) { bestVal = val; bestMove = [r, c]; }
-        if (val > alpha) alpha = val;
-        if (alpha >= beta) break;
+      // 3) 最高优先级防守：对手下一手能五连或组合杀，必须堵截
+      if (this.isTimeout()) return this.findEmptyFallback();
+      const oppT = this.findOppThreat(this.opp);
+      if (oppT) {
+        const blk = this.findBlockAgainst(oppT);
+        if (blk) return blk;
       }
-      if (bestMove && this.board[bestMove[0]][bestMove[1]] !== EMPTY) {
-        // 兜底：返回任意空位
-        return this.findEmptyFallback();
+
+      // 4) 迭代加深 + Alpha-Beta + 置换表搜索（全新完整预算）
+      this.resetSearch(260);
+      const mv = this.searchRoot(cfg);
+      if (mv) return mv;
+      return this.findEmptyFallback();
+    },
+
+    // ---- 时间控制（每次调用都核对时钟，Date.now() 开销可忽略） ----
+    resetSearch(ms) { this.deadline = Date.now() + (ms || 320); this.nodes = 0; },
+    isTimeout() { ++this.nodes; return Date.now() > this.deadline; },
+
+    // ---- Zobrist 初始化（52-bit：双 26-bit 半段） ----
+    zobInit() {
+      if (this.zTable) return;
+      const rnd = mulberry32(20260806);
+      const tbl = [[], [], []];
+      for (let c = 1; c <= 2; c++) {
+        const arr = new Array(361);
+        for (let i = 0; i < 361; i++) arr[i] = [(rnd() * 0x4000000) | 0, (rnd() * 0x4000000) | 0];
+        tbl[c] = arr;
       }
-      return bestMove;
+      this.zTable = tbl;
+    },
+    zobKeyAt(color, r, c) { return this.zTable[color][r * this.n + c]; },
+    place(r, c, color) {
+      this.board[r][c] = color;
+      const k = this.zobKeyAt(color, r, c);
+      this.zHi ^= k[0]; this.zLo ^= k[1];
+    },
+    unplace(r, c, color) {
+      this.board[r][c] = EMPTY;
+      const k = this.zobKeyAt(color, r, c);
+      this.zHi ^= k[0]; this.zLo ^= k[1];
+    },
+    hashNow() { return (this.zHi << 26) | this.zLo; },
+
+    // ---- 置换表 ----
+    ttClear() { this.tt = new Map(); this.ttMax = 262144; },
+    ttPut(depth, flag, val, move) {
+      const k = this.hashNow();
+      if (this.tt.size >= this.ttMax) this.tt.clear();
+      this.tt.set(k, { d: depth, f: flag, v: val, m: move });
+    },
+
+    // ---- 杀手启发 ----
+    killReset() { this.killers = []; },
+    addKiller(ply, r, c) {
+      if (!this.killers[ply]) this.killers[ply] = [];
+      const k = this.killers[ply];
+      if (k.length && k[0][0] === r && k[0][1] === c) return;
+      k.unshift([r, c]);
+      if (k.length > 2) k.pop();
     },
 
     findEmptyFallback() {
       const n = this.n;
-      // 先找邻近空位，再找任意空位
       for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
         if (this.board[r][c] === EMPTY && this.hasNeighbor(r, c, 1)) return [r, c];
       for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
         if (this.board[r][c] === EMPTY) return [r, c];
-      return [Math.floor(n/2), Math.floor(n/2)];
+      return [Math.floor(n / 2), Math.floor(n / 2)];
     },
 
-    countEmpty() { let s = 0; for (let r=0;r<this.n;r++)for(let c=0;c<this.n;c++)if(this.board[r][c]===EMPTY)s++; return s; },
-    countStones() { let s = 0; for (let r=0;r<this.n;r++)for(let c=0;c<this.n;c++)if(this.board[r][c]!==EMPTY)s++; return s; },
+    countStones() {
+      let s = 0;
+      for (let r = 0; r < this.n; r++) for (let c = 0; c < this.n; c++) if (this.board[r][c] !== EMPTY) s++;
+      return s;
+    },
 
     findFirstStone() {
-      for (let r=0;r<this.n;r++)for(let c=0;c<this.n;c++)if(this.board[r][c]!==EMPTY)return {row:r,col:c};
+      for (let r = 0; r < this.n; r++) for (let c = 0; c < this.n; c++)
+        if (this.board[r][c] !== EMPTY) return { row: r, col: c };
       return null;
     },
     near(r, c) {
       const n = this.n;
-      const s = Math.floor(n/2);
-      const cand=[];
-      for(let dr=-2;dr<=2;dr++)for(let dc=-2;dc<=2;dc++){
-        const rr=r+dr, cc=c+dc;
-        if(rr>=0&&rr<n&&cc>=0&&cc<n&&this.board[rr][cc]===EMPTY) cand.push([rr,cc]);
+      const s = Math.floor(n / 2);
+      const cand = [];
+      for (let dr = -2; dr <= 2; dr++) for (let dc = -2; dc <= 2; dc++) {
+        const rr = r + dr, cc = c + dc;
+        if (rr >= 0 && rr < n && cc >= 0 && cc < n && this.board[rr][cc] === EMPTY) cand.push([rr, cc]);
       }
-      if(!cand.length) return [s,s];
-      // 选择最接近天元的
-      cand.sort((a,b)=>{const da=Math.abs(a[0]-s)+Math.abs(a[1]-s);const db=Math.abs(b[0]-s)+Math.abs(b[1]-s);return da-db;});
+      if (!cand.length) return [s, s];
+      cand.sort(function (a, b) {
+        return (Math.abs(a[0] - s) + Math.abs(a[1] - s)) - (Math.abs(b[0] - s) + Math.abs(b[1] - s));
+      });
       return cand[0];
     },
-
-    // 生成候选（附近扫描）
-    genCandidates(me, cfg) {
-      const n = this.n;
-      const cand = [];
-      const seen = new Set();
-      const bestScore = new Map();
-      const R = cfg.depth <= 2 ? 1 : 1;
-      for (let r = 0; r < n; r++) {
-        for (let c = 0; c < n; c++) {
-          if (this.board[r][c] !== EMPTY) continue;
-          if (this.hasNeighbor(r, c, 1)) {
-            const key = r * n + c;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            let s = this.evalPoint(r, c, me);
-            cand.push([r, c, s, key]);
-          }
-        }
-      }
-      cand.sort((a, b) => b[2] - a[2]);
-      // 截断候选以提速（按难度限制）
-      const cap = cfg.cap || 12;
-      return cand.slice(0, cap).map(x => [x[0], x[1]]);
-    },
-
-    // 时间/节点预算
-    nodeBudget: 0,
-    nodeDeadline: 0,
-    beginSearch() { this.nodeBudget = 38000; this.nodeDeadline = Date.now() + 280; },
-    nodeUsed() { return this.nodeBudget <= 0 || Date.now() > this.nodeDeadline; },
 
     hasNeighbor(r, c, dist) {
       const n = this.n;
@@ -484,213 +549,391 @@
       return false;
     },
 
-    // 攻击性/防守性点评估（启发式）
-    evalPoint(r, c, me) {
-      let s = 0;
-      const opp = this.opp;
-      // 己方
-      s += this.patternScore(this.board, this.n, r, c, me) * 1.0;
-      // 防守
-      const oppS = this.patternScore(this.board, this.n, r, c, opp) * 1.1;
-      s += oppS;
-      // 中心偏好
-      const n = this.n, mid = Math.floor(n / 2);
-      const d = Math.abs(r - mid) + Math.abs(c - mid);
-      s -= d * 0.5;
+    // ---- 候选生成（radius=2 邻域；useComposite=true 时用组合威胁精排） ----
+    genCandidates(color, cfg, useComposite) {
+      const n = this.n;
+      const arr = [];
+      for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+        if (this.board[r][c] !== EMPTY) continue;
+        if (!this.hasNeighbor(r, c, 2)) continue;
+        const s = useComposite ? this.evalPoint(r, c, color) : this.fastEvalPoint(r, c, color);
+        arr.push([r, c, s]);
+      }
+      arr.sort(function (a, b) { return b[2] - a[2]; });
+      const cap = cfg.cap || 12;
+      return arr.slice(0, cap).map(function (x) { return [x[0], x[1]]; });
+    },
+
+    // ---- 组合威胁感知的点评估（用于根节点与 VCT 排序） ----
+    evalPoint(r, c, color) {
+      const b = this.board, n = this.n;
+      const opp = color === BLACK ? WHITE : BLACK;
+      b[r][c] = color;
+      const tMe = classifyPointAt(b, n, r, c, color);
+      b[r][c] = EMPTY;
+      b[r][c] = opp;
+      const tOpp = classifyPointAt(b, n, r, c, opp);
+      b[r][c] = EMPTY;
+      let s = threatValue(tMe) + threatValue(tOpp) * 1.1;
+      const mid = (n - 1) / 2;
+      s -= (Math.abs(r - mid) + Math.abs(c - mid)) * 0.5;
       return s;
     },
 
-    patternScore(board, n, r, c, color) {
-      let total = 0;
+    // ---- 快速点评估（内部节点排序用，连续段计分） ----
+    fastEvalPoint(r, c, color) {
+      const n = this.n, b = this.board;
+      let s = 0;
       for (let k = 0; k < 4; k++) {
         const dr = DIRS[k][0], dc = DIRS[k][1];
-        // 模拟在 (r,c) 放置后沿方向计数
-        board[r][c] = color;
-        const len = lineLen(board, n, r, c, dr, dc, color);
-        board[r][c] = EMPTY;
-        const openness = this.directionOpen(board, n, r, c, dr, dc, color);
-        total += this.fiveScore(len, openness);
+        b[r][c] = color;
+        const len = lineLen(b, n, r, c, dr, dc, color);
+        b[r][c] = EMPTY;
+        const open = this.directionOpen(r, c, dr, dc, color);
+        s += this.fiveScore(len, open);
       }
-      return total;
+      const mid = (n - 1) / 2;
+      s -= (Math.abs(r - mid) + Math.abs(c - mid)) * 0.5;
+      return s;
     },
 
-    directionOpen(board, n, r, c, dr, dc, color) {
-      // 放置后的两端开放数
-      board[r][c] = color;
+    directionOpen(r, c, dr, dc, color) {
+      const n = this.n, b = this.board;
+      b[r][c] = color;
       let open = 0;
       let rr = r + dr, cc = c + dc;
-      while (rr >= 0 && rr < n && cc >= 0 && cc < n && board[rr][cc] === color) { rr += dr; cc += dc; }
-      if (rr >= 0 && rr < n && cc >= 0 && cc < n && board[rr][cc] === EMPTY) open++;
+      while (rr >= 0 && rr < n && cc >= 0 && cc < n && b[rr][cc] === color) { rr += dr; cc += dc; }
+      if (rr >= 0 && rr < n && cc >= 0 && cc < n && b[rr][cc] === EMPTY) open++;
       rr = r - dr; cc = c - dc;
-      while (rr >= 0 && rr < n && cc >= 0 && cc < n && board[rr][cc] === color) { rr -= dr; cc -= dc; }
-      if (rr >= 0 && rr < n && cc >= 0 && cc < n && board[rr][cc] === EMPTY) open++;
-      board[r][c] = EMPTY;
+      while (rr >= 0 && rr < n && cc >= 0 && cc < n && b[rr][cc] === color) { rr -= dr; cc -= dc; }
+      if (rr >= 0 && rr < n && cc >= 0 && cc < n && b[rr][cc] === EMPTY) open++;
+      b[r][c] = EMPTY;
       return open;
     },
 
     fiveScore(len, open) {
-      const canWin = len >= 5;
       if (len >= 5) return 10000000;
       if (len === 4) return open >= 2 ? 1000000 : (open >= 1 ? 500000 : 10000);
-      if (len === 3) {
-        if (open >= 2) return 100000;
-        if (open >= 1) return 20000;
-        return 2000;
-      }
-      if (len === 2) {
-        if (open >= 2) return 10000;
-        if (open >= 1) return 1000;
-        return 100;
-      }
-      if (len === 1) {
-        if (open >= 2) return 200;
-        if (open >= 1) return 50;
-        return 10;
-      }
+      if (len === 3) return open >= 2 ? 100000 : (open >= 1 ? 20000 : 2000);
+      if (len === 2) return open >= 2 ? 10000 : (open >= 1 ? 1000 : 100);
+      if (len === 1) return open >= 2 ? 200 : (open >= 1 ? 50 : 10);
       return 0;
     },
 
-    // 全盘评估（当前局面，视角 color）
-    evalBoard(color) {
+    // ---- 叶子评估（全盘 5 窗口扫描 + 组合威胁聚合），视角 = 己方 - 对方 ----
+    evalLeaf() {
       const n = this.n, b = this.board;
-      let score = 0;
-      for (let r = 0; r < n; r++) {
-        for (let c = 0; c < n; c++) {
-          if (b[r][c] === color) {
-            score += this.stoneScore(r, c, color);
+      const agg = [
+        { five: 0, live4: 0, rush4: 0, live3: 0, rush3: 0 },
+        { five: 0, live4: 0, rush4: 0, live3: 0, rush3: 0 }
+      ];
+      const dirs = [[0, 1], [1, 0], [1, 1], [1, -1]];
+      for (let di = 0; di < 4; di++) {
+        const dr = dirs[di][0], dc = dirs[di][1];
+        for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+          const pr = r - dr, pc = c - dc;
+          if (pr >= 0 && pr < n && pc >= 0 && pc < n) continue;   // 仅从线起点出发
+          this.scanLine(r, c, dr, dc, agg);
+        }
+      }
+      const myA = agg[this.me - 1], opA = agg[this.opp - 1];
+      const w = function (a) {
+        return a.five * 100000000 + a.live4 * 10000000 + a.rush4 * 1000000 +
+               a.live3 * 100000 + a.rush3 * 10000;
+      };
+      let sMe = w(myA), sOpp = w(opA);
+      if (myA.live4 >= 1 || myA.rush4 >= 2 || (myA.rush4 >= 1 && myA.live3 >= 1) || myA.live3 >= 2) sMe += 5000000;
+      if (opA.live4 >= 1 || opA.rush4 >= 2 || (opA.rush4 >= 1 && opA.live3 >= 1) || opA.live3 >= 2) sOpp += 5000000;
+      return sMe - sOpp;
+    },
+
+    scanLine(r0, c0, dr, dc, agg) {
+      const n = this.n, b = this.board;
+      const cells = [];
+      let r = r0, c = c0;
+      while (r >= 0 && r < n && c >= 0 && c < n) { cells.push([r, c]); r += dr; c += dc; }
+      const L = cells.length;
+      if (L < 5) return;
+      for (let col = 1; col <= 2; col++) {
+        const fourPts = new Set(), threePts = new Set();
+        let wins = 0;
+        for (let s = 0; s + 4 < L; s++) {
+          let cnt = 0, e = null, e2 = null;
+          for (let i = s; i < s + 5; i++) {
+            const v = b[cells[i][0]][cells[i][1]];
+            if (v === col) cnt++;
+            else if (v === EMPTY) { if (e === null) e = i; else if (e2 === null) e2 = i; }
+          }
+          if (cnt === 5) wins++;
+          else if (cnt === 4 && e !== null && e2 === null) fourPts.add(e);
+          else if (cnt === 3) { if (e !== null) threePts.add(e); if (e2 !== null) threePts.add(e2); }
+        }
+        const a = agg[col - 1];
+        if (wins > 0) a.five++;
+        if (fourPts.size >= 2) a.live4++; else if (fourPts.size === 1) a.rush4++;
+        a.live3 += Math.floor(threePts.size / 2);
+        a.rush3 += threePts.size % 2;
+      }
+    },
+
+    // ---- Negamax + Alpha-Beta + Zobrist 置换表 + 杀手启发 ----
+    search(cfg, depth, alpha, beta, ply) {
+      if (this.isTimeout()) return 0;
+      const key = this.hashNow();
+      const ttE = this.tt.get(key);
+      if (ttE && ttE.d >= depth) {
+        if (ttE.f === 1) return ttE.v;
+        if (ttE.f === 2 && ttE.v <= alpha) return ttE.v;
+        if (ttE.f === 3 && ttE.v >= beta) return ttE.v;
+      }
+      if (depth <= 0) {
+        const s = this.evalLeaf();
+        return (ply % 2 === 0) ? s : -s;
+      }
+      const color = (ply % 2 === 0) ? this.me : this.opp;
+      const cand = this.orderCandidates(color, cfg, ply, ttE ? ttE.m : null);
+      let best = -Infinity, bestMove = null;
+      let alpha0 = alpha;
+      for (let i = 0; i < cand.length; i++) {
+        const r = cand[i][0], c = cand[i][1];
+        if (state.renju && color === BLACK && isForbidden(this.board, this.n, r, c)) continue;
+        this.place(r, c, color);
+        let val;
+        if (checkWin(this.board, this.n, r, c) === color) {
+          val = WIN_BASE - depth;
+        } else {
+          val = -this.search(cfg, depth - 1, -beta, -alpha0, ply + 1);
+        }
+        this.unplace(r, c, color);
+        if (this.isTimeout()) return 0;
+        if (val > best) { best = val; bestMove = [r, c]; }
+        if (val > alpha0) alpha0 = val;
+        if (alpha0 >= beta) { this.addKiller(ply, r, c); break; }
+      }
+      if (best === -Infinity) return 0;
+      if (bestMove) {
+        let flag = 1;
+        if (best <= alpha) flag = 2;
+        else if (best >= beta) flag = 3;
+        this.ttPut(depth, flag, best, bestMove);
+      }
+      return best;
+    },
+
+    // ---- 候选排序：TT 着法 + 杀手着法优先 ----
+    orderCandidates(color, cfg, ply, ttMove) {
+      const cand = this.genCandidates(color, cfg, false);
+      if (ttMove) {
+        for (let i = 0; i < cand.length; i++) {
+          if (cand[i][0] === ttMove[0] && cand[i][1] === ttMove[1]) {
+            if (i > 0) cand.unshift(cand.splice(i, 1)[0]);
+            break;
           }
         }
       }
-      return score;
+      const kk = this.killers[ply];
+      if (kk) {
+        for (let j = 0; j < kk.length; j++) {
+          for (let i = 1; i < cand.length; i++) {
+            if (cand[i][0] === kk[j][0] && cand[i][1] === kk[j][1]) {
+              cand.unshift(cand.splice(i, 1)[0]);
+              break;
+            }
+          }
+        }
+      }
+      return cand;
     },
 
-    stoneScore(r, c, color) {
-      let s = 0;
+    // ---- 迭代加深根搜索 ----
+    searchRoot(cfg) {
+      this.zobInit();
+      this.ttClear();
+      this.killReset();
+      this.zHi = 0; this.zLo = 0;
+      const n = this.n, b = this.board;
+      for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+        const v = b[r][c];
+        if (v !== EMPTY) { const k = this.zobKeyAt(v, r, c); this.zHi ^= k[0]; this.zLo ^= k[1]; }
+      }
+      let bestMove = null;
+      for (let d = 1; d <= cfg.depth; d++) {
+        if (this.isTimeout()) break;
+        const moves = this.genCandidates(this.me, cfg, true);
+        let alpha = -Infinity, beta = Infinity, bm = null, bv = -Infinity;
+        for (let i = 0; i < moves.length; i++) {
+          const r = moves[i][0], c = moves[i][1];
+          if (state.renju && this.me === BLACK && isForbidden(this.board, n, r, c)) continue;
+          this.place(r, c, this.me);
+          let val;
+          if (checkWin(this.board, n, r, c) === this.me) {
+            val = WIN_BASE;
+          } else {
+            val = -this.search(cfg, d - 1, -beta, -alpha, 1);
+          }
+          this.unplace(r, c, this.me);
+          if (this.isTimeout()) break;
+          if (val > bv) { bv = val; bm = [r, c]; }
+          if (val > alpha) alpha = val;
+          if (alpha >= beta) break;
+        }
+        if (this.isTimeout()) break;
+        if (bm) bestMove = bm;
+      }
+      return bestMove;
+    },
+
+    // ---- 单步必杀：直接五连 或 一步组合杀（双三/三四/双四/活四） ----
+    vctWinOne(color) {
+      // 快速排序即可：组合威胁在逐点落子后精确判定
+      const cand = this.genCandidates(color, { depth: 6, cap: 20 }, false);
+      for (let i = 0; i < cand.length; i++) {
+        if (this.isTimeout()) return null;
+        const r = cand[i][0], c = cand[i][1];
+        if (state.renju && color === BLACK && isForbidden(this.board, this.n, r, c)) continue;
+        this.place(r, c, color);
+        if (checkWin(this.board, this.n, r, c) === color) { this.unplace(r, c, color); return [r, c]; }
+        const t = classifyPointAt(this.board, this.n, r, c, color);
+        const dbl = isDoubleThreat(t);
+        let safe = true;
+        if (dbl) {
+          const comps = this.completionPointsOf(r, c, color);
+          const pts = comps.four.concat(comps.three);
+          for (let j = 0; j < pts.length; j++) {
+            const br = pts[j][0], bc = pts[j][1];
+            this.place(br, bc, this.opp);
+            if (checkWin(this.board, this.n, br, bc) === this.opp) safe = false;
+            this.unplace(br, bc, this.opp);
+            if (!safe) break;
+          }
+        }
+        this.unplace(r, c, color);
+        if (dbl && safe) return [r, c];
+      }
+      return null;
+    },
+
+    // ---- 落子后 (r,c) 的全部威胁完成点（4 石窗空白 + 3 石窗空白） ----
+    completionPointsOf(r, c, color) {
+      const n = this.n, b = this.board;
+      const four = [], three = [];
       for (let k = 0; k < 4; k++) {
         const dr = DIRS[k][0], dc = DIRS[k][1];
-        const len = this.runFrom(r, c, dr, dc, color);
-        // 只计正向以去重
-        const rr = r - dr, cc = c - dc;
-        if (rr >= 0 && rr < this.n && cc >= 0 && cc < this.n && this.board[rr][cc] === color) continue;
-        const open = this.runOpenForward(r, c, dr, dc, color);
-        s += this.fiveScore(len, open);
-      }
-      return s;
-    },
-
-    runFrom(r, c, dr, dc, color) {
-      let rr = r, cc = c, len = 0;
-      while (rr >= 0 && rr < this.n && cc >= 0 && cc < this.n && this.board[rr][cc] === color) {
-        len++; rr += dr; cc += dc;
-      }
-      return len;
-    },
-    runOpenForward(r, c, dr, dc, color) {
-      // 段首开放 + 段尾开放
-      let rr = r, cc = c;
-      while (rr >= 0 && rr < this.n && cc >= 0 && cc < this.n && this.board[rr][cc] === color) { rr += dr; cc += dc; }
-      let open = 0;
-      if (rr >= 0 && rr < this.n && cc >= 0 && cc < this.n && this.board[rr][cc] === EMPTY) open++;
-      let rl = r - dr, cl = c - dc;
-      if (rl >= 0 && rl < this.n && cl >= 0 && cl < this.n && this.board[rl][cl] === EMPTY) open++;
-      return open;
-    },
-
-    // negamax + alpha-beta（递归返回数值）
-    negamaxTrack(cands, cfg, alpha, beta, depth, lastColor) {
-      if (this.nodeBudget-- <= 0) return 0;
-      const n = this.n;
-      const isMax = (depth % 2 === 0);
-      if (depth >= cfg.depth) {
-        const s = isMax ? this.evalBoard(this.me) : this.evalBoard(this.opp);
-        return isMax ? s : -s;
-      }
-      const color = isMax ? this.me : this.opp;
-      const cand = this.genCandidates(color, cfg);
-      let best = -Infinity;
-      for (const [r, c] of cand) {
-        if (state.renju && color === BLACK && isForbidden(this.board, n, r, c)) continue;
-        this.board[r][c] = color;
-        const win = checkWin(this.board, n, r, c);
-        let val;
-        if (win === color) {
-          val = 10000000 + (cfg.depth - depth);
-        } else {
-          val = -this.negamaxTrack(cand, cfg, -beta, -alpha, depth + 1, color);
+        for (let s = -4; s <= 0; s++) {
+          let cnt = 0;
+          const empties = [];
+          let inb = true;
+          for (let i = 0; i < 5; i++) {
+            const rr = r + (s + i) * dr, cc = c + (s + i) * dc;
+            if (rr < 0 || rr >= n || cc < 0 || cc >= n) { inb = false; break; }
+            const v = b[rr][cc];
+            if (v === color) cnt++;
+            else if (v === EMPTY) empties.push([rr, cc]);
+          }
+          if (!inb) continue;
+          if (cnt === 4 && empties.length === 1) four.push(empties[0]);
+          else if (cnt === 3) for (let j = 0; j < empties.length; j++) three.push(empties[j]);
         }
-        this.board[r][c] = EMPTY;
-        if (this.nodeBudget <= 0) break;
-        if (val > best) best = val;
-        if (val > alpha) alpha = val;
-        if (alpha >= beta) break;
       }
-      return best === -Infinity ? 0 : best;
+      return { four: four, three: three };
     },
 
-    // VCF/VCT：简单连杀搜索（返回必杀点或防守点）
-    vcfSearch(color, maxDepth) {
-      const n = this.n;
-      // 搜索当前 color 能否在 maxDepth 步内强制获胜
-      const killers = this.findKillerMoves(color);
-      if (killers.length) return killers[0];
-      // 增强版：尝试二段冲
-      if (maxDepth >= 2) {
-        for (let step = 0; step < 2; step++) {
-          const next = this.findKillerMoves(color);
-          if (next.length) return next[0];
+    // ---- 强化 VCT：递归“连续冲四/活三”追杀，返回必杀落点或 null ----
+    vct(color, plyLeft) {
+      if (plyLeft <= 0 || this.isTimeout()) return null;
+      // 快速排序即可（组合威胁在落子后逐点精确判定）
+      const cand = this.genCandidates(color, { depth: 6, cap: 14 }, false);
+      for (let i = 0; i < cand.length; i++) {
+        if (this.isTimeout()) return null;
+        const r = cand[i][0], c = cand[i][1];
+        if (state.renju && color === BLACK && isForbidden(this.board, this.n, r, c)) continue;
+        this.place(r, c, color);
+        if (checkWin(this.board, this.n, r, c) === color) { this.unplace(r, c, color); return [r, c]; }
+        const t = classifyPointAt(this.board, this.n, r, c, color);
+        if (isDoubleThreat(t)) {
+          // 组合杀：对手无法一子全堵（逐一验证无反杀）
+          let safe = true;
+          const comps = this.completionPointsOf(r, c, color);
+          const pts = comps.four.concat(comps.three);
+          for (let j = 0; j < pts.length; j++) {
+            const br = pts[j][0], bc = pts[j][1];
+            this.place(br, bc, this.opp);
+            if (checkWin(this.board, this.n, br, bc) === this.opp) safe = false;
+            this.unplace(br, bc, this.opp);
+            if (!safe) break;
+          }
+          if (safe) { this.unplace(r, c, color); return [r, c]; }
+        } else if (t.rush4 === 1) {
+          // 单冲四：对手被迫堵唯一完成点，继续追杀
+          const comps = this.completionPointsOf(r, c, color);
+          if (comps.four.length) {
+            const br = comps.four[0][0], bc = comps.four[0][1];
+            this.place(br, bc, this.opp);
+            const oppWin = checkWin(this.board, this.n, br, bc) === this.opp;
+            const res = oppWin ? null : this.vct(color, plyLeft - 2);
+            this.unplace(br, bc, this.opp);
+            if (res) { this.unplace(r, c, color); return [r, c]; }
+          }
+        } else if (t.live3 >= 1) {
+          // 活三：对手全部防守都挡不住，才算追杀成功
+          const comps = this.completionPointsOf(r, c, color);
+          const blocks = comps.three;
+          let allWin = blocks.length > 0;
+          for (let j = 0; j < blocks.length; j++) {
+            const br = blocks[j][0], bc = blocks[j][1];
+            this.place(br, bc, this.opp);
+            if (checkWin(this.board, this.n, br, bc) === this.opp) {
+              this.unplace(br, bc, this.opp); allWin = false; break;
+            }
+            const r2 = this.vct(color, plyLeft - 2);
+            this.unplace(br, bc, this.opp);
+            if (!r2) { allWin = false; break; }
+          }
+          if (allWin) { this.unplace(r, c, color); return [r, c]; }
         }
-        return null;
+        this.unplace(r, c, color);
       }
       return null;
     },
 
-    findKillerMoves(color) {
-      const n = this.n;
-      const res = [];
-      const cand = this.genCandidates(color, { depth: 4 });
-      for (const [r, c] of cand) {
-        if (this.board[r][c] !== EMPTY) continue;
-        this.board[r][c] = color;
-        // 冲四(双四点更好)或直接赢
-        let threat = 0;
-        for (let k = 0; k < 4; k++) {
-          const dr = DIRS[k][0], dc = DIRS[k][1];
-          const info = this.segInfoAt(r, c, color, dr, dc);
-          if (info === "four") threat++;
-          if (threat >= 2) break;
-        }
-        if (threat >= 2) { this.board[r][c] = EMPTY; res.push([r, c]); continue; }
-        // 两端成活四
-        const winNow = checkWin(this.board, n, r, c);
-        if (winNow === color) {
-          // 双四（must）
-          this.board[r][c] = EMPTY;
-          // 复用上面逻辑，这里直接记录
-          res.push([r, c]);
-          continue;
-        }
-        this.board[r][c] = EMPTY;
+    // ---- 探测对手的最强威胁（五连 / 组合杀），返回 { point, win, t } 或 null ----
+    findOppThreat(colorOpp) {
+      const cand = this.genCandidates(colorOpp, { depth: 6, cap: 16 }, false);
+      for (let i = 0; i < cand.length; i++) {
+        if (this.isTimeout()) return null;
+        const r = cand[i][0], c = cand[i][1];
+        this.place(r, c, colorOpp);
+        const win = checkWin(this.board, this.n, r, c) === colorOpp;
+        const t = win ? { five: 1, live4: 0, rush4: 0, live3: 0, rush3: 0 } : classifyPointAt(this.board, this.n, r, c, colorOpp);
+        this.unplace(r, c, colorOpp);
+        if (win || isDoubleThreat(t)) return { point: [r, c], win: win, t: t };
       }
-      return res;
-    },
-
-    segInfoAt(r, c, color, dr, dc) {
-      const n = this.n;
-      this.board[r][c] = color;
-      const open = this.directionOpen(this.board, n, r, c, dr, dc, color);
-      const len = lineLen(this.board, n, r, c, dr, dc, color);
-      this.board[r][c] = EMPTY;
-      if (len >= 5) return "five";
-      if (len === 4 && open >= 1) return "four";
       return null;
     },
 
-    findVcfDefense(block) {
-      // 简单：防守在该必杀点邻近
-      const cand = this.genCandidates(this.me, { depth: 3 });
-      return cand[0] || this.findEmptyFallback();
+    // ---- 对对手威胁的最优堵截点 ----
+    findBlockAgainst(oppT) {
+      const pts = new Set();
+      pts.add(oppT.point[0] + "|" + oppT.point[1]);
+      const comps = this.completionPointsOf(oppT.point[0], oppT.point[1], this.opp);
+      for (let i = 0; i < comps.four.length; i++) pts.add(comps.four[i][0] + "|" + comps.four[i][1]);
+      for (let i = 0; i < comps.three.length; i++) pts.add(comps.three[i][0] + "|" + comps.three[i][1]);
+      let best = null, bestScore = -Infinity;
+      const keys = Array.from(pts);
+      for (let i = 0; i < keys.length; i++) {
+        if (this.isTimeout()) break;
+        const p = keys[i].split("|");
+        const br = parseInt(p[0], 10), bc = parseInt(p[1], 10);
+        if (this.board[br][bc] !== EMPTY) continue;
+        this.place(br, bc, this.me);
+        let s = checkWin(this.board, this.n, br, bc) === this.me ? WIN_BASE : this.evalLeaf();
+        this.unplace(br, bc, this.me);
+        if (s > bestScore) { bestScore = s; best = [br, bc]; }
+      }
+      return best || this.findEmptyFallback();
     }
   };
+
 
   /* ---------------- UI 交互 ---------------- */
 
@@ -1100,6 +1343,7 @@
       newBoard, checkWin, isForbidden, lineLen, EMPTY, BLACK, WHITE,
       state, draw, makeMove, newGame, aiToMove, undo,
       getPos, findWinningLine,
+      classifyPointAt, isDoubleThreat, threatValue, AI,
       set setState(o) { Object.assign(state, o); },
       getStatus() { return state; }
     };
