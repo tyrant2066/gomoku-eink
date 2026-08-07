@@ -1,0 +1,278 @@
+/* =========================================================
+   高智商人机五子棋 - 墨水屏(E-ink)高对比度极简风格
+   ========================================================= */
+
+/* 禁用一切动画与过渡，防止墨水屏刷新残影 */
+*, *::before, *::after {
+  box-sizing: border-box;
+  -webkit-animation: none !important;
+  animation: none !important;
+  -webkit-transition: none !important;
+  transition: none !important;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+}
+
+:root {
+  --bg: #ffffff;
+  --fg: #000000;
+  --panel: #e8e8e8;
+  --panel-border: #9a9a9a;
+  --btn-face: #dcdcdc;
+  --accent: #000000;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+
+#app {
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ============ 顶部栏 ============ */
+#topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 3px solid var(--fg);
+  font-weight: bold;
+}
+
+.player {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 20px;
+}
+
+.player .mark {
+  font-size: 12px;
+  line-height: 1;
+  display: none;
+  color: #000;
+}
+
+.player.active .mark { display: inline; }
+.player.active { color: var(--fg); }
+.player:not(.active) { color: #808080; }
+.player .mark { font-weight: normal; }
+
+/* 顶部棋子 */
+.stone {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: inline-block;
+  border: 2px solid #000;
+}
+.stone.black { background: #111; }
+.stone.white { background: #ffffff; }
+
+.score {
+  font-size: 26px;
+  letter-spacing: 4px;
+  color: var(--fg);
+}
+
+/* ============ 棋盘区 ============ */
+#board-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
+  min-height: 0;
+  width: 100%;
+}
+
+canvas#board {
+  display: block;
+  background: #f2ecd8;
+  border: 3px solid var(--fg);
+  touch-action: none;
+  max-width: 98%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+}
+
+#status-bar {
+  margin-top: 8px;
+  font-size: 18px;
+  color: var(--fg);
+  padding: 6px 18px;
+  border: 2px solid var(--fg);
+  background: #fff;
+  text-align: center;
+  letter-spacing: 1px;
+}
+
+/* ============ 底部工具栏 ============ */
+#toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  padding: 12px 10px calc(12px + env(safe-area-inset-bottom));
+  background: var(--panel);
+  border-top: 3px solid var(--fg);
+}
+
+.tool-btn {
+  flex: 1;
+  height: 74px;
+  font-size: 26px;
+  font-weight: bold;
+  color: var(--fg);
+  background: var(--btn-face);
+  border: 3px solid var(--fg);
+  border-radius: 10px;
+  cursor: pointer;
+  box-shadow: 0 4px 0 #000;
+}
+
+.tool-btn:active {
+  background: #ffffff;
+  box-shadow: 0 1px 0 #000;
+  -webkit-transform: translateY(3px);
+  transform: translateY(3px);
+}
+
+/* ============ 覆盖层 ============ */
+#overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 20px;
+}
+#overlay.hidden { display: none; }
+
+#overlay-box {
+  background: #fff;
+  border: 3px solid var(--fg);
+  border-radius: 12px;
+  padding: 22px;
+  max-width: 90%;
+  width: 420px;
+  text-align: center;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+#overlay-box h2 {
+  margin: 0 0 10px;
+  font-size: 26px;
+}
+#overlay-box p {
+  margin: 6px 0 16px;
+  font-size: 18px;
+  line-height: 1.6;
+  text-align: left;
+  color: #111;
+}
+#choice-row { display: flex; gap: 10px; justify-content: center; margin-bottom: 14px; }
+#choice-row button,
+#ov-close {
+  flex: 1;
+  padding: 14px 0;
+  font-size: 22px;
+  font-weight: bold;
+  color: var(--fg);
+  background: var(--btn-face);
+  border: 3px solid var(--fg);
+  border-radius: 8px;
+  cursor: pointer;
+}
+#ov-close { flex: 1; width: 100%; margin-top: 2px; }
+#choice-row button:active, #ov-close:active { background: #fff; }
+
+/* ============ 设置面板 ============ */
+.setting-group {
+  margin-bottom: 20px;
+  text-align: left;
+}
+.setting-group h3 {
+  margin: 0 0 10px;
+  font-size: 20px;
+  border-bottom: 2px solid var(--fg);
+  padding-bottom: 4px;
+}
+.seg-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.seg {
+  flex: 1;
+  min-width: 46px;
+  padding: 12px 4px;
+  font-size: 19px;
+  font-weight: bold;
+  text-align: center;
+  background: var(--btn-face);
+  border: 3px solid var(--fg);
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--fg);
+}
+.seg.active {
+  background: var(--fg);
+  color: #fff;
+}
+.switch-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 19px;
+  padding: 4px 0;
+  cursor: pointer;
+}
+.switch {
+  width: 74px;
+  height: 40px;
+  border: 3px solid var(--fg);
+  border-radius: 22px;
+  background: #fff;
+  position: relative;
+  cursor: pointer;
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: #bbb;
+  border: 2px solid var(--fg);
+}
+.switch.on { background: var(--fg); }
+.switch.on::after { left: 38px; background: #fff; }
+
+#about-text {
+  font-size: 16px;
+  line-height: 1.7;
+  color: #111;
+}
+#about-text b { display: block; margin-bottom: 6px; }
