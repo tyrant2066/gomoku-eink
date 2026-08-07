@@ -623,6 +623,9 @@
 
   /* ---------------- UI 交互 ---------------- */
 
+  // 防抖：忽略极短时间内对同一交叉点的重复触发（规避 PointerEvent 与 TouchEvent 双发）
+  let lastTap = { t: 0, r: -1, c: -1 };
+
   function clickHandler(e) {
     if (state.over) return;
     if (state.current !== state.human) return;
@@ -631,6 +634,11 @@
     const { row, col } = pos;
     if (row < 0 || row >= state.n || col < 0 || col >= state.n) return;
     if (state.board[row][col] !== EMPTY) return;
+
+    // 防抖阈值：500ms 内同一交叉点只落一子
+    const now = Date.now();
+    if (row === lastTap.r && col === lastTap.c && (now - lastTap.t) < 500) return;
+    lastTap = { t: now, r: row, c: col };
 
     // 禁手判断
     if (state.human === BLACK && state.renju && isForbidden(state.board, state.n, row, col)) {
@@ -732,15 +740,38 @@
     pWhite.querySelector(".mark").textContent = "●";
   }
 
+  // 取事件坐标（TouchEvent / PointerEvent / MouseEvent 兼容）
+  function eventClientXY(e) {
+    if (e.touches && e.touches.length) {
+      return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+    if (e.changedTouches && e.changedTouches.length) {
+      return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+    }
+    return { x: e.clientX, y: e.clientY };
+  }
+
+  // 坐标映射：屏幕坐标 -> 棋盘交叉点（row, col）
+  // 使用 getBoundingClientRect() + CSS比例换算到画布内部像素，确保 11/15/19 网格均精确对称吸附
   function getPos(e) {
+    const { x: clx, y: cly } = eventClientXY(e);
     const rect = canvas.getBoundingClientRect();
-    const cx = e.touches ? e.touches[0].clientX : e.clientX;
-    const cy = e.touches ? e.touches[0].clientY : e.clientY;
-    const x = cx - rect.left;
-    const y = cy - rect.top;
-    const grid = rect.width / (state.n - 1);
-    const col = Math.round(x / grid);
-    const row = Math.round(y / grid);
+    if (!rect.width || !rect.height) return null;
+    // 由 CSS 显示尺寸换算到画布内部像素（一统处理 DPR 与 CSS 缩放），与 draw() 同基准
+    const x = (clx - rect.left) * (canvas.width / rect.width);
+    const y = (cly - rect.top) * (canvas.height / rect.height);
+
+    const grid = canvas.width / (state.n - 1);   // 画布内部每格像素
+    const margin = grid / 2;                     // 首条网格线相对原点(左上)的偏移
+
+    // 相对第一条网格线的偏移（去除左侧/顶部外边距），Y 轴与之完全对称
+    const sx = x - margin;
+    const sy = y - margin;
+
+    // 标准最近邻吸附：Math.floor(v + 0.5) 对落在网格线左右半格内均精确归一到该列/行，
+    // 避免使用浮点敏感的 Math.round 带来整体偏一列的问题
+    const col = Math.floor(sx / grid + 0.5);
+    const row = Math.floor(sy / grid + 0.5);
     return { row, col };
   }
 
@@ -931,11 +962,35 @@
   }
 
   /* ---------------- 事件绑定 ---------------- */
-  canvas.addEventListener("pointerdown", function (e) {
+
+  // 全局去重锁：同一物理按下在极短时间内（约 350ms）只处理一次，
+  // 彻底防止 PointerEvent 与 TouchEvent/MouseEvent 在支持指针事件的设备上双发落子。
+  let lastEventGuard = { t: 0, x: 0, y: 0 };
+  function guardedClick(e) {
+    // 鼠标仅响应主键
+    if (e.type === "mousedown" && e.button !== 0) return;
     e.preventDefault();
-    if (e.pointerType === "mouse" && e.button !== 0) return;
+    const { x, y } = eventClientXY(e);
+    const now = Date.now();
+    if ((now - lastEventGuard.t) < 350 &&
+        Math.abs(x - lastEventGuard.x) < 6 &&
+        Math.abs(y - lastEventGuard.y) < 6) {
+      return; // 判定为双发事件，忽略
+    }
+    lastEventGuard = { t: now, x, y };
     clickHandler(e);
-  }, { passive: false });
+  }
+
+  const supportsPointer = "PointerEvent" in window;
+  if (supportsPointer) {
+    // 指针事件优先：鼠标主键 / 触摸 / 触控笔
+    canvas.addEventListener("pointerdown", guardedClick, { passive: false });
+    // 兜底：某些老浏览器光标点触发不了 pointerdown 时
+    canvas.addEventListener("mousedown", guardedClick, { passive: false });
+  } else {
+    canvas.addEventListener("mousedown", guardedClick, { passive: false });
+    canvas.addEventListener("touchstart", guardedClick, { passive: false });
+  }
 
   document.getElementById("btn-new").onclick = openNewGame;
   document.getElementById("btn-undo").onclick = undo;
@@ -961,6 +1016,7 @@
     globalThis.__GOMOKU_API__ = {
       newBoard, checkWin, isForbidden, lineLen, EMPTY, BLACK, WHITE,
       state, draw, makeMove, newGame, aiToMove, undo,
+      getPos,
       set setState(o) { Object.assign(state, o); },
       getStatus() { return state; }
     };

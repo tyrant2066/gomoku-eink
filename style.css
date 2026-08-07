@@ -107,7 +107,9 @@ canvas#board {
   display: block;
   background: #f2ecd8;
   border: 3px solid var(--fg);
-  touch-action: none;
+  touch-action: none;                        /* 交给 JS 处理，禁用页面滚动缩放 */
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;               /* 长按不出系统菜单，提升触控落子流畅 */
   max-width: 98%;
   max-height: 100%;
   width: auto;
