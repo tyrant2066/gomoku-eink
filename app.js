@@ -49,7 +49,6 @@
     winning: null,      // 终局五连高亮：成五的 5 颗棋子数组 [[r,c],...]
     renju: false,       // 禁手开关
     difficulty: 3,
-    engine: "native",   // AI 引擎模式："native" 原生轻量引擎 / "wasm" WASM 棋圣引擎
     score: { black: 0, white: 0 }
   };
 
@@ -943,14 +942,20 @@
   let wasmError = false;        // 加载失败标记
   let wasmRate = 0;             // 节点预算/毫秒（校准值，0 = 未校准）
 
-  // 校准局面（模拟中后盘 40 子，贴近真实局面的节点成本）
-  const WASM_CALIB_STONES = [
-    [9,9],[9,10],[8,10],[10,9],[8,8],[10,10],[7,9],[11,9],
-    [6,9],[12,10],[9,12],[9,7],[8,12],[10,6],[11,11],[9,6],
-    [13,9],[7,5],[12,5],[5,9],[14,9],[9,14],[4,9],[15,9],
-    [9,15],[6,6],[12,12],[8,16],[16,8],[3,17],[17,3],[10,4],
-    [4,10],[14,14],[5,15],[15,5],[11,4],[4,11],[7,14],[14,7]
-  ];
+  // 校准局面（威胁结构型中盘：多列交错活二/活三，保证校准触发真实搜索；
+  // 散子局面搜索极快会导致速率虚高、预算爆炸）
+  const WASM_CALIB_STONES = [];
+  (function () {
+    const blackRows = [9, 7, 5, 11, 13];
+    const whiteRows = [10, 8, 6, 12, 14];
+    for (let i = 0; i < blackRows.length; i++) {
+      const cols = [9, 10, 12, 13];
+      for (let j = 0; j < cols.length; j++) {
+        WASM_CALIB_STONES.push([blackRows[i], cols[j]]);
+        WASM_CALIB_STONES.push([whiteRows[i], cols[j]]);
+      }
+    }
+  })();
 
   // AssemblyScript 运行时需要的最小导入
   const WASM_IMPORTS = { env: { abort: function () {} } };
@@ -1006,7 +1011,10 @@
   // WASM 预算：按目标时长 × 测速速率（0.7 安全系数，节点成本随盘面复杂度上升）
   function wasmBudget() {
     if (wasmRate <= 0) return 60000;   // 未校准时保守默认
-    return Math.max(4000, Math.round(wasmRate * ((WASM_TARGET_MS[state.difficulty] || 200) * 0.7)));
+    let b = Math.round(wasmRate * ((WASM_TARGET_MS[state.difficulty] || 200) * 0.7));
+    if (b < 10000) b = 10000;          // 下限：保证基础搜索深度
+    if (b > 300000) b = 300000;        // 上限：防止校准偏差导致单步超时
+    return b;
   }
 
   // 同步当前棋盘到 WASM 引擎（init 同时完成规格同步与 Zobrist 初始化）
@@ -1051,6 +1059,7 @@
     AI.me = me;
     AI.opp = opp;
     AI.renju = state.renju;
+    AI.zobInit();   // 幂等；findOppThreat 内部 place() 需要 Zobrist 表
     AI.resetSearch(60);
     let result = wasmMove;
     try {
@@ -1143,12 +1152,11 @@
     const me = state.current;
     let mv = null;
 
-    if (state.engine === "wasm" && wasmEngine) {
-      // WASM 棋圣引擎：异常/禁手非法时回退原生引擎
+    // 统一大师级 WASM 引擎；未就绪/异常/禁手非法时回退 JS 轻量引擎
+    if (wasmEngine) {
       mv = wasmBestMove(me);
       if (!mv) mv = AI.bestMove(state.board, state.n, me, state.renju, null);
     } else {
-      // 原生轻量引擎（WASM 未就绪时自动回退到这里）
       mv = AI.bestMove(state.board, state.n, me, state.renju, null);
     }
 
@@ -1340,13 +1348,9 @@
     const d = state.difficulty;
     const sz = state.size;
     const renjuOn = state.renju;
-    const eng = state.engine;
     const wasmOk = typeof WebAssembly !== "undefined";
     let html = "";
-    html += `<div class="setting-group"><h3>AI 引擎模式</h3><div class="seg-row">`;
-    html += `<div class="seg ${eng==='native'?'active':''}" data-engine="native">原生轻量</div>`;
-    html += `<div class="seg ${eng==='wasm'?'active':''} ${!wasmOk?'disabled':''}" data-engine="wasm">WASM 棋圣</div>`;
-    html += `</div><div class="hint" id="engine-hint">${!wasmOk ? '当前设备不支持 WebAssembly' : (eng === 'wasm' ? 'WASM 棋圣引擎（按需加载，职业级算杀）' : '零依赖威胁空间搜索，秒开省电')}</div></div>`;
+    html += `<div class="setting-group"><h3>AI 引擎</h3><div class="hint" id="engine-hint">${!wasmOk ? '当前设备不支持 WebAssembly' : (wasmEngine ? '大师级引擎已就绪（威胁空间算杀 + 开局库）' : (wasmError ? '引擎加载失败，已回退轻量引擎' : '大师级引擎加载中…'))}</div></div>`;
 
     html += `<div class="setting-group"><h3>AI 智商等级</h3><div class="seg-row">`;
     for (let lv = 1; lv <= 5; lv++) {
@@ -1365,30 +1369,6 @@
   }
 
   function bindSettingsEvents(panel) {
-    const engSegs = panel.querySelectorAll(".seg[data-engine]");
-    engSegs.forEach(function (s) {
-      s.onclick = function () {
-        if (s.classList.contains("disabled")) return;
-        engSegs.forEach(x => x.classList.remove("active"));
-        s.classList.add("active");
-        state.engine = s.dataset.engine;
-        const hint = document.getElementById("engine-hint");
-        if (hint) {
-          hint.textContent = state.engine === 'wasm'
-            ? (wasmEngine ? 'WASM 棋圣引擎已就绪' : (wasmError ? 'WASM 加载失败，将回退原生引擎' : 'WASM 引擎加载中…'))
-            : '零依赖威胁空间搜索，秒开省电';
-        }
-        // 选择模式 B 时按需在后台加载 .wasm（不阻塞页面）
-        if (state.engine === "wasm" && !wasmEngine && !wasmLoading) {
-          loadWasmEngine().then(function () {
-            const h = document.getElementById("engine-hint");
-            if (h) h.textContent = "WASM 棋圣引擎已就绪";
-            statusText.textContent = "WASM 引擎已就绪";
-          }).catch(function () {});
-        }
-      };
-    });
-
     const segs = panel.querySelectorAll(".seg[data-d]");
     segs.forEach(function (s) {
       s.onclick = function () {
@@ -1454,13 +1434,12 @@
     const box = document.createElement("div");
     box.id = "about-text";
     box.innerHTML =
-      "<b>高智商人机五子棋 v1.2</b>" +
+      "<b>高智商人机五子棋 v2.0</b>" +
       "专为 10 寸墨水屏 Pad（墨案 X 等）深度优化。纯黑白灰高对比度，禁用动画防残影，点击即刻响应。<br><br>" +
       "<b>规则</b><br>自由五子棋：无禁手，允许双三、双四、长连。可于设置中开启黑方三三/四四/长连禁手（连珠规则）。<br><br>" +
-      "<b>AI 引擎（双引擎可切换）</b><br>模式 A 原生轻量引擎：威胁空间搜索 TSS + Zobrist 置换表 + 组合杀招识别，零依赖秒开省电。<br>" +
-      "模式 B WASM 棋圣引擎：按需异步加载，职业级强算杀，按设备测速自动校准思考时长。<br>" +
-      "两种引擎均支持五级难度：①新手入门 ②进阶 ③高手 ④大师 ⑤棋圣（算杀必杀）。<br><br>" +
-      "<b>操作</b><br>新开-选执子色重开；悔棋-回退玩家+AI 各一步；设置-调引擎/难度/棋盘/禁手。<br><br>" +
+      "<b>AI 引擎</b><br>统一大师级引擎（Gomocup 系架构）：威胁空间搜索 TSS + 完整 VCF/VCT 连杀 + 对手反威胁验证 + 开局定式库 + Zobrist 置换表 + 迭代加深。<br>" +
+      "五级难度按思考预算分级：①新手入门 ②进阶 ③高手 ④大师 ⑤棋圣（算杀必杀）。<br><br>" +
+      "<b>操作</b><br>新开-选执子色重开；悔棋-回退玩家+AI 各一步；设置-调难度/棋盘/禁手。<br><br>" +
       "零依赖单页应用，双击 index.html 或部署 Vercel 即用。";
     row.appendChild(box);
   }
@@ -1513,6 +1492,13 @@
     hideOverlay();
     updateScore();
     draw();
+  }
+
+  // 后台预加载大师级 WASM 引擎（不影响首屏渲染与输入响应）
+  if (typeof WebAssembly !== "undefined") {
+    loadWasmEngine().then(function () {
+      statusText.textContent = "大师级引擎已就绪，黑方先行";
+    }).catch(function () {});
   }
 
   // 供自动化测试导出的内部逻辑（仅测试环境使用，不影响生产）
