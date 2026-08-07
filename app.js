@@ -932,89 +932,66 @@
     }
   };
 
-  /* ---------------- WASM 棋圣引擎（按需异步加载） ---------------- */
+  /* ---------------- WASM 大师级引擎（异步加载，静态预算） ---------------- */
 
-  // 难度 -> 目标思考时长（毫秒），配合设备测速校准
-  const WASM_TARGET_MS = [0, 50, 100, 200, 350, 500];
+  // 难度 1-5 -> 静态节点预算（万级阶梯，不依赖设备测速，
+  // 彻底消除后台同步算杀对低配 CPU/内存的瞬间冲击）
+  const WASM_BUDGETS = [0, 10000, 30000, 60000, 100000, 150000];
 
   let wasmEngine = null;        // 已实例化的 exports
   let wasmLoading = null;       // 进行中的加载 Promise
   let wasmError = false;        // 加载失败标记
-  let wasmRate = 0;             // 节点预算/毫秒（校准值，0 = 未校准）
-
-  // 校准局面（威胁结构型中盘：多列交错活二/活三，保证校准触发真实搜索；
-  // 散子局面搜索极快会导致速率虚高、预算爆炸）
-  const WASM_CALIB_STONES = [];
-  (function () {
-    const blackRows = [9, 7, 5, 11, 13];
-    const whiteRows = [10, 8, 6, 12, 14];
-    for (let i = 0; i < blackRows.length; i++) {
-      const cols = [9, 10, 12, 13];
-      for (let j = 0; j < cols.length; j++) {
-        WASM_CALIB_STONES.push([blackRows[i], cols[j]]);
-        WASM_CALIB_STONES.push([whiteRows[i], cols[j]]);
-      }
-    }
-  })();
 
   // AssemblyScript 运行时需要的最小导入
   const WASM_IMPORTS = { env: { abort: function () {} } };
 
+  // 异步加载 WASM（fetch/instantiate 全程异步，不阻塞主线程；
+  // 任何失败仅回退 JS 引擎，绝不允许引发崩溃）
   function loadWasmEngine() {
     if (wasmEngine) return Promise.resolve(wasmEngine);
     if (wasmLoading) return wasmLoading;
     wasmLoading = (async function () {
-      const wasmOk = typeof WebAssembly !== "undefined" && typeof WebAssembly.instantiate === "function";
+      let wasmOk = false;
+      try {
+        wasmOk = typeof WebAssembly !== "undefined" && typeof WebAssembly.instantiate === "function";
+      } catch (e) { wasmOk = false; }
       if (!wasmOk) throw new Error("当前设备不支持 WebAssembly");
-      let mod;
-      if (typeof WebAssembly.instantiateStreaming === "function") {
-        try {
-          mod = await WebAssembly.instantiateStreaming(fetch("engine.wasm", { cache: "force-cache" }), WASM_IMPORTS);
-        } catch (err) {
+      let mod = null;
+      try {
+        if (typeof WebAssembly.instantiateStreaming === "function") {
+          try {
+            mod = await WebAssembly.instantiateStreaming(fetch("engine.wasm", { cache: "force-cache" }), WASM_IMPORTS);
+          } catch (err) {
+            const buf = await (await fetch("engine.wasm", { cache: "force-cache" })).arrayBuffer();
+            mod = await WebAssembly.instantiate(buf, WASM_IMPORTS);
+          }
+        } else {
           const buf = await (await fetch("engine.wasm", { cache: "force-cache" })).arrayBuffer();
           mod = await WebAssembly.instantiate(buf, WASM_IMPORTS);
         }
-      } else {
-        const buf = await (await fetch("engine.wasm", { cache: "force-cache" })).arrayBuffer();
-        mod = await WebAssembly.instantiate(buf, WASM_IMPORTS);
+      } catch (err) {
+        throw new Error("engine.wasm 加载失败: " + (err && err.message ? err.message : err));
       }
-      wasmEngine = mod.instance.exports;
-      calibrateWasm();
+      try {
+        wasmEngine = mod.instance.exports;
+        wasmEngine.init(state.n);   // 轻量初始化（仅分配/生成内部表，无算杀）
+      } catch (err) {
+        wasmEngine = null;
+        throw new Error("WASM 初始化失败: " + (err && err.message ? err.message : err));
+      }
       return wasmEngine;
     })().catch(function (err) {
       wasmLoading = null;
       wasmError = true;
-      statusText.textContent = "WASM 引擎加载失败，已回退原生引擎";
+      try { statusText.textContent = "引擎加载失败，已回退轻量引擎"; } catch (e) {}
       throw err;
     });
     return wasmLoading;
   }
 
-  // 用固定中盘局面测量设备节点速度，随后各难度按目标时长换算节点预算
-  function calibrateWasm() {
-    try {
-      const w = wasmEngine;
-      w.init(19);
-      for (let i = 0; i < WASM_CALIB_STONES.length; i++) {
-        w.setCell(WASM_CALIB_STONES[i][0], WASM_CALIB_STONES[i][1], (i % 2 === 0) ? BLACK : WHITE);
-      }
-      const t0 = Date.now();
-      w.think(BLACK, 80000);
-      const ms = Date.now() - t0;
-      wasmRate = ms > 5 ? (80000 / ms) * 0.85 : 0;   // 85% 安全系数
-      w.init(state.n);
-    } catch (err) {
-      wasmRate = 0;
-    }
-  }
-
-  // WASM 预算：按目标时长 × 测速速率（0.7 安全系数，节点成本随盘面复杂度上升）
+  // WASM 预算：静态节点阶梯（墨案低配也可流畅运行）
   function wasmBudget() {
-    if (wasmRate <= 0) return 60000;   // 未校准时保守默认
-    let b = Math.round(wasmRate * ((WASM_TARGET_MS[state.difficulty] || 200) * 0.7));
-    if (b < 10000) b = 10000;          // 下限：保证基础搜索深度
-    if (b > 300000) b = 300000;        // 上限：防止校准偏差导致单步超时
-    return b;
+    return WASM_BUDGETS[state.difficulty] || 60000;
   }
 
   // 同步当前棋盘到 WASM 引擎（init 同时完成规格同步与 Zobrist 初始化）
@@ -1494,11 +1471,19 @@
     draw();
   }
 
-  // 后台预加载大师级 WASM 引擎（不影响首屏渲染与输入响应）
+  // 空闲时异步预加载大师级 WASM 引擎（首屏渲染与输入响应优先；
+  // 加载全程异步无同步算杀，不影响任何交互）
   if (typeof WebAssembly !== "undefined") {
-    loadWasmEngine().then(function () {
-      statusText.textContent = "大师级引擎已就绪，黑方先行";
-    }).catch(function () {});
+    var idleFn = function () {
+      loadWasmEngine().then(function () {
+        try { statusText.textContent = "大师级引擎已就绪，黑方先行"; } catch (e) {}
+      }).catch(function () {});
+    };
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(idleFn, { timeout: 2000 });
+    } else {
+      setTimeout(idleFn, 800);
+    }
   }
 
   // 供自动化测试导出的内部逻辑（仅测试环境使用，不影响生产）
@@ -1508,7 +1493,7 @@
       state, draw, makeMove, newGame, aiToMove, undo,
       getPos, findWinningLine,
       classifyPointAt, isDoubleThreat, threatValue, AI,
-      loadWasmEngine, wasmBestMove, wasmBudget, calibrateWasm, wasmEngine,
+      loadWasmEngine, wasmBestMove, wasmBudget, wasmEngine,
       set setState(o) { Object.assign(state, o); },
       getStatus() { return state; }
     };

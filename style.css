@@ -170,7 +170,8 @@ canvas#board {
 #overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0,0,0,0.55);
+  /* 墨水屏兼容：纯色浅灰背景，避免半透明混合对低配 WebView 的渲染负担 */
+  background: #dddddd;
   display: flex;
   align-items: center;
   justify-content: center;

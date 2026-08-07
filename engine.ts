@@ -872,8 +872,7 @@ export function init(n: i32): void {
   N = n;
   for (let i = 0; i < MAXN * MAXN; i++) board[i] = EMPTY;
   zh1 = 0; zh2 = 0;
-  ttClear();
-  killers.fill(-1);
+  // TT/杀手由 think() 每次开局前清空即可，init 不再重复清（每步同步更轻）
 }
 
 export function clear(): void {
