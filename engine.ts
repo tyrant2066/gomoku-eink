@@ -1,4 +1,4 @@
-// =========================================================
+﻿// =========================================================
 // 五子棋 WASM 棋圣引擎（AssemblyScript）
 // 威胁空间搜索 TSS：VCF/VCT 连杀算杀 + Negamax/Alpha-Beta
 // + Zobrist 置换表 + 杀手启发 + 迭代加深
@@ -364,6 +364,13 @@ function timeout(): boolean {
   return nodes > budget;
 }
 
+// VCT 阶段独立预算（防止活三递归验证挤占防守与主搜索）
+let vctCap: i32 = 0;
+function timeoutVCT(): boolean {
+  nodes++;
+  return nodes > vctCap;
+}
+
 // 完成点收集（4 石窗空白 / 3 石窗空白），以及按层快照（递归安全）
 let cpR = new Int16Array(16);
 let cpC = new Int16Array(16);
@@ -408,7 +415,7 @@ function vctWinOne(col: i32): boolean {
   genCandidates(col, false, 16, LAYER_VCT1);
   const base = LAYER_VCT1 * CAND_MAX;
   for (let i = 0; i < candCnt[LAYER_VCT1]; i++) {
-    if (timeout()) return false;
+    if (timeoutVCT()) return false;
     const r = candR[base + i], c = candC[base + i];
     place(r, c, col);
     if (checkWinAt(r, c, col)) { gMoveR = r; gMoveC = c; unplace(r, c, col); return true; }
@@ -440,12 +447,12 @@ function vctWinOne(col: i32): boolean {
 
 // VCT 递归（连续冲四/活三追杀）；候选按 plyLeft 分层存储
 function vctSearch(col: i32, plyLeft: i32): boolean {
-  if (plyLeft <= 0 || timeout()) return false;
+  if (plyLeft <= 0 || timeoutVCT()) return false;
   const layer = 19 + (10 - plyLeft) / 2;
   genCandidates(col, false, 12, layer);
   const base = layer * CAND_MAX;
   for (let i = 0; i < candCnt[layer]; i++) {
-    if (timeout()) return false;
+    if (timeoutVCT()) return false;
     const r = candR[base + i], c = candC[base + i];
     place(r, c, col);
     if (checkWinAt(r, c, col)) { gMoveR = r; gMoveC = c; unplace(r, c, col); return true; }
@@ -609,6 +616,45 @@ function searchRoot(maxDepth: i32): boolean {
   return false;
 }
 
+// ---- 我方直接成五（最高优先级，先于防守） ----
+function myDirectWin(col: i32): boolean {
+  genCandidates(col, false, 20, LAYER_VCT1);
+  const base = LAYER_VCT1 * CAND_MAX;
+  for (let i = 0; i < candCnt[LAYER_VCT1]; i++) {
+    if (timeout()) return false;
+    const r = candR[base + i], c = candC[base + i];
+    place(r, c, col);
+    const win = checkWinAt(r, c, col);
+    unplace(r, c, col);
+    if (win) { gMoveR = r; gMoveC = c; return true; }
+  }
+  return false;
+}
+
+// 防守点评估：先最小化“堵截后对手最强下一手威胁”，再比较己方棋型。
+// 纯棋型净值会让“自己成活三”误判为最优防守，必须让对手威胁主导。
+function defenseScore(br: i32, bc: i32): i32 {
+  place(br, bc, me);
+  if (checkWinAt(br, bc, me)) { unplace(br, bc, me); return WIN_BASE; }
+  // 扫描对手最强下一手威胁（复用 LAYER_BLOCK 的对手候选列表）
+  let worst = 0;
+  const base2 = LAYER_BLOCK * CAND_MAX;
+  for (let j = 0; j < candCnt[LAYER_BLOCK]; j++) {
+    const rr = candR[base2 + j], cc = candC[base2 + j];
+    if (cell(rr, cc) !== EMPTY) continue;
+    place(rr, cc, opp);
+    const win = checkWinAt(rr, cc, opp);
+    classifyPoint(rr, cc, opp);
+    let v = win ? 100000000 : threatValue();
+    unplace(rr, cc, opp);
+    if (v > worst) worst = v;
+  }
+  const myEval = evalLeaf();
+  unplace(br, bc, me);
+  // 对手威胁主导（活四 1e7 → -1e8，冲四 1e6 → -1e7），己方棋型为次级区分
+  return -worst * 10 + myEval / 1000;
+}
+
 // ---- 对手威胁强制防守（五连/组合杀/冲四/活三 全部覆盖） ----
 function findOppBlock(): boolean {
   genCandidates(opp, false, 16, LAYER_BLOCK);
@@ -633,22 +679,16 @@ function findOppBlock(): boolean {
     // 防守点集合：对手落点本身 + 四完成点 + 三完成点（递归内无此循环，快照全局即可）
     const cpN = cpCount, cqN = cqCount;
     // 1) 对手落点本身（先手堵死）
-    place(r, c, me);
-    let s0 = checkWinAt(r, c, me) ? WIN_BASE : evalLeaf();
-    unplace(r, c, me);
+    let s0 = defenseScore(r, c);
     if (s0 > bestScore) { bestScore = s0; bR = r; bC = c; found = true; }
     // 2) 冲四完成点
     for (let j = 0; j < cpN; j++) {
-      place(cpR[j], cpC[j], me);
-      let s = checkWinAt(cpR[j], cpC[j], me) ? WIN_BASE : evalLeaf();
-      unplace(cpR[j], cpC[j], me);
+      let s = defenseScore(cpR[j], cpC[j]);
       if (s > bestScore) { bestScore = s; bR = cpR[j]; bC = cpC[j]; found = true; }
     }
     // 3) 活三完成点
     for (let j = 0; j < cqN; j++) {
-      place(cqR[j], cqC[j], me);
-      let s = checkWinAt(cqR[j], cqC[j], me) ? WIN_BASE : evalLeaf();
-      unplace(cqR[j], cqC[j], me);
+      let s = defenseScore(cqR[j], cqC[j]);
       if (s > bestScore) { bestScore = s; bR = cqR[j]; bC = cqC[j]; found = true; }
     }
   }
@@ -707,13 +747,18 @@ export function think(col: i32, nodeBudget: i32): i32 {
       gMoveR = br; gMoveC = bc; return 1;
     }
   }
-  // 1) 单步必杀 / 组合杀
-  if (vctWinOne(me)) return 1;
-  // 2) VCT 连续追杀
-  if (vctSearch(me, 10)) return 1;
-  // 3) 对手威胁强制防守（含单活三/冲四）
+  // 优先级（棋理核心）：
+  // 1) 我方直接成五（最快杀）
+  // 2) 对手威胁强制防守（成五/活四/双威胁/冲四/活三）—— 对手活三=两步杀且先手，
+  //    我方双三=三步杀，来不及；故防守必须优先于一切非直接成五的进攻
+  // 3) 我方单步组合杀（双三/三四/双四/活四）—— 此时已确认对手无即时威胁
+  // 4) VCT 连续追杀（阶段预算限制，避免挤占主搜索）
+  // 5) 迭代加深主搜索
+  if (myDirectWin(me)) return 1;
   if (findOppBlock()) return 1;
-  // 4) 迭代加深
+  vctCap = budget / 4 + 5000;
+  if (vctWinOne(me)) return 1;
+  if (vctSearch(me, 10)) return 1;
   if (timeout()) return 0;
   const maxDepth = budget > 400000 ? 8 : (budget > 150000 ? 7 : (budget > 40000 ? 6 : (budget > 12000 ? 5 : 4)));
   if (searchRoot(maxDepth)) return 1;

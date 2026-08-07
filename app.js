@@ -403,21 +403,16 @@
         if (first) return this.near(first.row, first.col);
       }
 
-      // 前段预算（VCT 算杀 / 防守探测）：用完立即释放，保证主搜索有充足时间
+      // 前段预算（直接成五 / 防守探测 / 算杀）：用完立即释放，保证主搜索有充足时间
       this.resetSearch(80);
       this.zobInit();   // place()/unplace() 需要 Zobrist 表（幂等，仅初始化一次）
 
-      // 1) 单步必杀：直接五连 或 一步组合杀（双三/三四/双四/活四）
-      const one = this.vctWinOne(me);
-      if (one) return one;
+      // 1) 我方直接成五（最高优先级）
+      const winNow = this.myDirectWin(me);
+      if (winNow) return winNow;
 
-      // 2) VCT 连续追杀（难度 >=2 开启）：递归“连续冲四/活三”强制五连
-      if (cfg.vct) {
-        const kill = this.vct(me, cfg.vctPly);
-        if (kill) return kill;
-      }
-
-      // 3) 最高优先级防守：对手下一手能五连或组合杀，必须堵截
+      // 2) 对手威胁强制防守（成五/活四/双威胁/冲四/活三）：
+      //    对手活三=两步杀且先手，我方双三=三步杀来不及；防守必须优先于非直接成五的进攻
       if (this.isTimeout()) return this.findEmptyFallback();
       const oppT = this.findOppThreat(this.opp);
       if (oppT) {
@@ -425,11 +420,36 @@
         if (blk) return blk;
       }
 
-      // 4) 迭代加深 + Alpha-Beta + 置换表搜索（全新完整预算）
+      // 3) 我方单步组合杀（双三/三四/双四/活四）——此时已确认对手无即时威胁
+      const one = this.vctWinOne(me);
+      if (one) return one;
+
+      // 4) VCT 连续追杀（难度 >=2 开启）：递归“连续冲四/活三”强制五连
+      if (cfg.vct) {
+        const kill = this.vct(me, cfg.vctPly);
+        if (kill) return kill;
+      }
+
+      // 5) 迭代加深 + Alpha-Beta + 置换表搜索（全新完整预算）
       this.resetSearch(260);
       const mv = this.searchRoot(cfg);
       if (mv) return mv;
       return this.findEmptyFallback();
+    },
+
+    // ---- 我方直接成五 ----
+    myDirectWin(color) {
+      const cand = this.genCandidates(color, { depth: 6, cap: 20 }, false);
+      for (let i = 0; i < cand.length; i++) {
+        if (this.isTimeout()) return null;
+        const r = cand[i][0], c = cand[i][1];
+        if (state.renju && color === BLACK && isForbidden(this.board, this.n, r, c)) continue;
+        this.place(r, c, color);
+        const win = checkWin(this.board, this.n, r, c) === color;
+        this.unplace(r, c, color);
+        if (win) return [r, c];
+      }
+      return null;
     },
 
     // ---- 时间控制（每次调用都核对时钟，Date.now() 开销可忽略） ----
@@ -923,11 +943,13 @@
   let wasmError = false;        // 加载失败标记
   let wasmRate = 0;             // 节点预算/毫秒（校准值，0 = 未校准）
 
-  // 校准局面（模拟中盘 20 手，评估真实节点速度）
+  // 校准局面（模拟中后盘 40 子，贴近真实局面的节点成本）
   const WASM_CALIB_STONES = [
     [9,9],[9,10],[8,10],[10,9],[8,8],[10,10],[7,9],[11,9],
     [6,9],[12,10],[9,12],[9,7],[8,12],[10,6],[11,11],[9,6],
-    [13,9],[7,5],[12,5],[5,9]
+    [13,9],[7,5],[12,5],[5,9],[14,9],[9,14],[4,9],[15,9],
+    [9,15],[6,6],[12,12],[8,16],[16,8],[3,17],[17,3],[10,4],
+    [4,10],[14,14],[5,15],[15,5],[11,4],[4,11],[7,14],[14,7]
   ];
 
   // AssemblyScript 运行时需要的最小导入
@@ -981,10 +1003,10 @@
     }
   }
 
-  // WASM 预算：按目标时长 × 测速速率
+  // WASM 预算：按目标时长 × 测速速率（0.7 安全系数，节点成本随盘面复杂度上升）
   function wasmBudget() {
     if (wasmRate <= 0) return 60000;   // 未校准时保守默认
-    return Math.max(4000, Math.round(wasmRate * (WASM_TARGET_MS[state.difficulty] || 200)));
+    return Math.max(4000, Math.round(wasmRate * ((WASM_TARGET_MS[state.difficulty] || 200) * 0.7)));
   }
 
   // 同步当前棋盘到 WASM 引擎（init 同时完成规格同步与 Zobrist 初始化）
@@ -1010,10 +1032,43 @@
       if (state.board[r][c] !== EMPTY) return null;
       // 禁手模式下 WASM 着法需复核
       if (state.renju && me === BLACK && isForbidden(state.board, state.n, r, c)) return null;
-      return [r, c];
+      // 防守兜底（双保险）：JS 侧独立探测对手威胁，
+      // 若 WASM 着法未落在防守点上，强制替换为最优堵截点
+      const safe = jsDefenseCheck(me, [r, c]);
+      return safe;
     } catch (err) {
       return null;
     }
+  }
+
+  // JS 侧防守校验：对手存在成五/活四/双威胁/冲四/活三时，返回最优堵截点
+  function jsDefenseCheck(me, wasmMove) {
+    const opp = me === BLACK ? WHITE : BLACK;
+    const savedDeadline = AI.deadline, savedNodes = AI.nodes;
+    // 关键：同步 AI 引擎的棋盘引用（WASM 模式下 AI.board 可能残留旧棋盘）
+    AI.board = state.board;
+    AI.n = state.n;
+    AI.me = me;
+    AI.opp = opp;
+    AI.renju = state.renju;
+    AI.resetSearch(60);
+    let result = wasmMove;
+    try {
+      const oppT = AI.findOppThreat(opp);
+      if (oppT) {
+        const blk = AI.findBlockAgainst(oppT);
+        if (blk) {
+          // 禁手模式下堵截点也需复核
+          if (!(state.renju && me === BLACK && isForbidden(state.board, state.n, blk[0], blk[1]))) {
+            result = blk;
+          }
+        }
+      }
+    } finally {
+      AI.deadline = savedDeadline;
+      AI.nodes = savedNodes;
+    }
+    return result;
   }
 
   /* ---------------- UI 交互 ---------------- */
