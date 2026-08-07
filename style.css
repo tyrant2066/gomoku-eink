@@ -110,10 +110,12 @@ canvas#board {
   touch-action: none;                        /* 交给 JS 处理，禁用页面滚动缩放 */
   -webkit-user-select: none;
   -webkit-touch-callout: none;               /* 长按不出系统菜单，提升触控落子流畅 */
-  max-width: 98%;
-  max-height: 100%;
+  /* 尺寸由 draw() 显式设置为 1:1（内部像素 = 显示像素），
+     避免 max-width/auto 隐式缩放导致边缘渲染漂移 */
   width: auto;
   height: auto;
+  max-width: 100%;
+  max-height: 100%;
 }
 
 #status-bar {

@@ -62,11 +62,19 @@
   /* ---------------- Canvas 绘制 ---------------- */
   function draw() {
     const n = state.n;
+    // 画布内部像素与 CSS 显示尺寸严格 1:1（消除缩放导致的边缘渲染漂移）
     const size = Math.floor(Math.min(wrap.clientWidth - 8, wrap.clientHeight - 70));
+    if (size < 32) return;
     canvas.width = size;
     canvas.height = size;
+    try {
+      canvas.style.width = size + "px";
+      canvas.style.height = size + "px";
+    } catch (e) {}
     const grid = size / (n - 1);
     const margin = grid / 2;
+    const minXY = margin;
+    const maxXY = size - margin;      // 最外层网格交点坐标（绘制硬边界）
 
     // 背景
     ctx.fillStyle = "#f2ecd8";
@@ -103,9 +111,9 @@
       ctx.fill();
     });
 
-    // 棋子
+    // 棋子（半径硬上限：保证棋子整体落在最外层网格交点之内，绝不越界）
     const last = state.moves.length ? state.moves[state.moves.length - 1] : null;
-    const rStone = Math.min(22, grid * 0.42);
+    const rStone = Math.min(22, grid * 0.42, Math.max(2, margin - 1));
     for (let r = 0; r < n; r++) {
       for (let c = 0; c < n; c++) {
         const v = state.board[r][c];
@@ -127,18 +135,19 @@
       ctx.fill();
     }
 
-    // 胜局高亮：仅沿成五的 5 颗棋子中心绘制一条加粗贯穿线，不加任何外框
+    // 胜局高亮：仅沿成五的 5 颗棋子中心绘制一条加粗贯穿线，端点严格钳制在网格交点内
     if (state.over && state.winning && state.winning.length) {
       const cells = state.winning;
-      const x0 = margin + cells[0][1] * grid;
-      const y0 = margin + cells[0][0] * grid;
-      const x1 = margin + cells[cells.length - 1][1] * grid;
-      const y1 = margin + cells[cells.length - 1][0] * grid;
+      const cx0 = Math.min(maxXY, Math.max(minXY, margin + cells[0][1] * grid));
+      const cy0 = Math.min(maxXY, Math.max(minXY, margin + cells[0][0] * grid));
+      const cx1 = Math.min(maxXY, Math.max(minXY, margin + cells[cells.length - 1][1] * grid));
+      const cy1 = Math.min(maxXY, Math.max(minXY, margin + cells[cells.length - 1][0] * grid));
       ctx.beginPath();
-      ctx.moveTo(x0, y0);
-      ctx.lineTo(x1, y1);
+      ctx.moveTo(cx0, cy0);
+      ctx.lineTo(cx1, cy1);
       ctx.strokeStyle = "#000000";
       ctx.lineWidth = Math.max(4, rStone * 0.35);
+      ctx.lineCap = "butt";
       ctx.stroke();
     }
   }
@@ -1353,9 +1362,14 @@
     const d = state.difficulty;
     const sz = state.size;
     const renjuOn = state.renju;
-    const wasmOk = typeof WebAssembly !== "undefined";
     let html = "";
-    html += `<div class="setting-group"><h3>AI 引擎</h3><div class="hint" id="engine-hint">${!wasmOk ? '当前设备不支持 WebAssembly' : (wasmEngine ? '大师级引擎已就绪（威胁空间算杀 + 开局库）' : (wasmError ? '引擎加载失败，已回退轻量引擎' : '大师级引擎加载中…'))}</div></div>`;
+    // 引擎状态只读提示（统一大师级引擎，无模式切换）
+    let engHint = "大师级引擎加载中…";
+    try {
+      if (wasmWorkerReady) engHint = "大师级引擎已就绪（威胁空间算杀 + 开局库）";
+      else if (wasmError) engHint = "引擎加载失败，已回退轻量引擎";
+    } catch (e) {}
+    html += `<div class="setting-group"><h3>AI 引擎</h3><div class="hint">${engHint}</div></div>`;
 
     html += `<div class="setting-group"><h3>AI 智商等级</h3><div class="seg-row">`;
     for (let lv = 1; lv <= 5; lv++) {
@@ -1507,6 +1521,7 @@
       getPos, findWinningLine,
       classifyPointAt, isDoubleThreat, threatValue, AI,
       loadWasmWorker, wasmMoveAsync, wasmBudget, jsDefenseCheck,
+      openSettings, wrapSettingsHTML,
       set setState(o) { Object.assign(state, o); },
       getStatus() { return state; }
     };
