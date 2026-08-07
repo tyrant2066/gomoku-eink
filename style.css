@@ -127,6 +127,15 @@ canvas#board {
   letter-spacing: 1px;
 }
 
+/* 终局状态：反色高对比横幅，强化输赢辨识（墨水屏黑底白字） */
+#status-bar.game-over {
+  background: #000000;
+  color: #ffffff;
+  font-weight: bold;
+  border-width: 3px;
+  font-size: 20px;
+}
+
 /* ============ 底部工具栏 ============ */
 #toolbar {
   flex: 0 0 auto;

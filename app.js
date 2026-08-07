@@ -29,6 +29,7 @@
   const canvas = document.getElementById("board");
   const ctx = canvas.getContext("2d");
   const statusText = document.getElementById("status-text");
+  const statusBar = document.getElementById("status-bar");
   const wrap = document.getElementById("board-wrap");
   const pBlack = document.getElementById("player-black");
   const pWhite = document.getElementById("player-white");
@@ -45,6 +46,7 @@
     human: BLACK,       // 人类执子
     over: false,
     winner: 0,
+    winning: null,      // 终局五连高亮：成五的 5 颗棋子数组 [[r,c],...]
     renju: false,       // 禁手开关
     difficulty: 3,
     score: { black: 0, white: 0 }
@@ -114,16 +116,55 @@
       }
     }
 
-    // 最后一步标记点
+    // 最后一手落子超高亮（高对比外框 + 中心对比标记），墨水屏绝对醒目
     if (last) {
       const x = margin + last[1] * grid;
       const y = margin + last[0] * grid;
-      const dotR = Math.max(3, rStone * 0.18);
-      ctx.beginPath();
-      ctx.arc(x, y, dotR, 0, Math.PI * 2);
       const v = state.board[last[0]][last[1]];
-      ctx.fillStyle = v === BLACK ? "#fff" : "#000";
+      // 高对比外框：黑棋用加粗白圈，白棋用加粗黑圈
+      ctx.beginPath();
+      ctx.arc(x, y, rStone * 1.28, 0, Math.PI * 2);
+      ctx.strokeStyle = v === BLACK ? "#ffffff" : "#000000";
+      ctx.lineWidth = Math.max(3, rStone * 0.24);
+      ctx.stroke();
+      // 中心对比标记：黑棋用白色圆点，白棋用黑色圆点（废除浅色小圆点）
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(3.5, rStone * 0.22), 0, Math.PI * 2);
+      ctx.fillStyle = v === BLACK ? "#ffffff" : "#000000";
       ctx.fill();
+    }
+
+    // 终局五连高亮：沿 5 颗成五棋子中心绘制贯穿连线 + 逐颗加粗高亮外框
+    if (state.over && state.winning && state.winning.length) {
+      const cells = state.winning;
+      const xs = cells.map(p => margin + p[1] * grid);
+      const ys = cells.map(p => margin + p[0] * grid);
+      const [x0, y0] = [xs[0], ys[0]];
+      const [x1, y1] = [xs[xs.length - 1], ys[ys.length - 1]];
+      // 贯穿连线（从第一颗中心延伸到最后一颗中心）
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      ctx.strokeStyle = "#000000";
+      ctx.lineWidth = Math.max(4, rStone * 0.35);
+      ctx.stroke();
+      // 连珠高亮外框
+      const hlCol = state.winner === BLACK ? "#000000" : "#ffffff";
+      const hlCtr = state.winner === BLACK ? "#ffffff" : "#000000";
+      cells.forEach(([r, c]) => {
+        const cx = margin + c * grid;
+        const cy = margin + r * grid;
+        ctx.beginPath();
+        ctx.arc(cx, cy, rStone * 1.28, 0, Math.PI * 2);
+        ctx.strokeStyle = hlCol;
+        ctx.lineWidth = Math.max(3, rStone * 0.24);
+        ctx.stroke();
+        // 中心小圆点（与黑/白棋对比色）
+        ctx.beginPath();
+        ctx.arc(cx, cy, Math.max(3, rStone * 0.18), 0, Math.PI * 2);
+        ctx.fillStyle = hlCtr;
+        ctx.fill();
+      });
     }
   }
 
@@ -251,6 +292,36 @@
       if (lineLen(board, n, r, c, DIRS[k][0], DIRS[k][1], color) >= 5) return color;
     }
     return 0;
+  }
+
+  // 检测以 (r,c) 为落点、包含它的精确 5 颗连珠（用于胜局高亮）。
+  // 返回 5 颗棋子的坐标数组 [[r,c],...]；若连长 >5（长连）则取包含 (r,c) 的连续 5 颗。
+  function findWinningLine(board, n, r, c) {
+    const color = board[r][c];
+    if (color === EMPTY) return null;
+    for (let k = 0; k < 4; k++) {
+      const dr = DIRS[k][0], dc = DIRS[k][1];
+      const len = lineLen(board, n, r, c, dr, dc, color);
+      if (len < 5) continue;
+      // 找连续段起点（沿负方向）
+      let sr = r, sc = c;
+      while (sr - dr >= 0 && sr - dr < n && sc - dc >= 0 && sc - dc < n &&
+             board[sr - dr][sc - dc] === color) {
+        sr -= dr; sc -= dc;
+      }
+      // 连续段为 [sr,sc] 起的 len 颗，取包含 (r,c) 的 5 颗（长连时尽量以 (r,c) 居中）
+      let idx = (dr !== 0) ? (r - sr) / Math.abs(dr) : (c - sc) / Math.abs(dc);
+      let start = Math.max(0, idx - 2);
+      if (start > len - 5) start = len - 5;
+      const cells = [];
+      let rr = sr + start * dr, cc = sc + start * dc;
+      for (let i = 0; i < 5; i++) {
+        cells.push([rr, cc]);
+        rr += dr; cc += dc;
+      }
+      return cells;
+    }
+    return null;
   }
 
   function isDraw(board, n) {
@@ -657,6 +728,7 @@
 
     const win = checkWin(state.board, state.n, row, col);
     if (win) {
+      state.winning = findWinningLine(state.board, state.n, row, col);
       endGame(color, state.moves.length, [row, col]);
       draw();
       return;
@@ -706,17 +778,23 @@
     if (winner === WHITE) state.score.white++;
     updateScore();
     updateTopBar();
-
-    let msg;
-    if (winner === 0) msg = "平局";
-    else if (winner === state.human) {
-      msg = "你赢了";
-      openOverlay("你赢了 🎉", "太棒了！再战一局？", true);
+    // draw() 此时已绘制出五连高亮，先让玩家看清成五，再延迟弹出结果
+    if (winner === 0) {
+      statusBar.classList.add("game-over");
+      statusText.textContent = "平局";
+      openOverlay("平局", "棋盘已满，势均力敌！", true);
     } else {
-      msg = "AI 获胜";
-      openOverlay("AI 获胜", "继续挑战更高的难度吧！", true);
+      const humanWin = winner === state.human;
+      statusBar.classList.add("game-over");
+      statusText.textContent = humanWin ? "你赢了" : "AI 获胜";
+      const title = humanWin ? "你赢了 🎉" : "AI 获胜";
+      const desc = humanWin ? "太棒了！再战一局？" : "继续挑战更高的难度吧！";
+      setTimeout(function () {
+        // 若期间已新开棋局则不再弹窗
+        if (!state.over) return;
+        openOverlay(title, desc, true);
+      }, 900);
     }
-    statusText.textContent = msg === "平局" ? "平局" : msg;
     void ply; void last;
   }
 
@@ -796,7 +874,9 @@
     state.moves = [];
     state.over = false;
     state.winner = 0;
+    state.winning = null;
     state.current = BLACK;
+    statusBar.classList.remove("game-over");
     hideOverlay();
     updateTopBar();
     statusText.textContent = "黑方先行";
@@ -828,6 +908,7 @@
     }
     state.over = false;
     state.winner = 0;
+    state.winning = null;
     state.current = state.human;
     updateTopBar();
     statusText.textContent = (state.human === BLACK ? "黑方" : "白方") + "走棋";
@@ -931,7 +1012,9 @@
     state.moves = [];
     state.over = false;
     state.winner = 0;
+    state.winning = null;
     state.current = BLACK;
+    statusBar.classList.remove("game-over");
     // 若玩家执白则 AI 先行
     updateTopBar();
     statusText.textContent = "棋盘已切换为" + sz.label;
@@ -1016,7 +1099,7 @@
     globalThis.__GOMOKU_API__ = {
       newBoard, checkWin, isForbidden, lineLen, EMPTY, BLACK, WHITE,
       state, draw, makeMove, newGame, aiToMove, undo,
-      getPos,
+      getPos, findWinningLine,
       set setState(o) { Object.assign(state, o); },
       getStatus() { return state; }
     };
