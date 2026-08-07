@@ -932,61 +932,74 @@
     }
   };
 
-  /* ---------------- WASM 大师级引擎（异步加载，静态预算） ---------------- */
+  /* ---------------- WASM 大师级引擎（Web Worker 异步，主线程零阻塞） ---------------- */
 
-  // 难度 1-5 -> 静态节点预算（万级阶梯，不依赖设备测速，
-  // 彻底消除后台同步算杀对低配 CPU/内存的瞬间冲击）
+  // 难度 1-5 -> 静态节点预算（万级阶梯）
   const WASM_BUDGETS = [0, 10000, 30000, 60000, 100000, 150000];
 
-  let wasmEngine = null;        // 已实例化的 exports
-  let wasmLoading = null;       // 进行中的加载 Promise
-  let wasmError = false;        // 加载失败标记
+  let wasmWorker = null;        // Worker 实例（WASM 加载/编译/算杀全在线程内）
+  let wasmWorkerReady = false;  // Worker 内引擎已就绪
+  let wasmError = false;        // 加载失败标记（此后永久回退 JS 引擎）
+  let wasmLoading = false;      // 加载进行中
+  let pendingMove = null;       // 等待 WASM 走棋结果的回调
+  let moveSeq = 0;
 
-  // AssemblyScript 运行时需要的最小导入
-  const WASM_IMPORTS = { env: { abort: function () {} } };
-
-  // 异步加载 WASM（fetch/instantiate 全程异步，不阻塞主线程；
-  // 任何失败仅回退 JS 引擎，绝不允许引发崩溃）
-  function loadWasmEngine() {
-    if (wasmEngine) return Promise.resolve(wasmEngine);
-    if (wasmLoading) return wasmLoading;
-    wasmLoading = (async function () {
-      let wasmOk = false;
-      try {
-        wasmOk = typeof WebAssembly !== "undefined" && typeof WebAssembly.instantiate === "function";
-      } catch (e) { wasmOk = false; }
-      if (!wasmOk) throw new Error("当前设备不支持 WebAssembly");
-      let mod = null;
-      try {
-        if (typeof WebAssembly.instantiateStreaming === "function") {
-          try {
-            mod = await WebAssembly.instantiateStreaming(fetch("engine.wasm", { cache: "force-cache" }), WASM_IMPORTS);
-          } catch (err) {
-            const buf = await (await fetch("engine.wasm", { cache: "force-cache" })).arrayBuffer();
-            mod = await WebAssembly.instantiate(buf, WASM_IMPORTS);
-          }
-        } else {
-          const buf = await (await fetch("engine.wasm", { cache: "force-cache" })).arrayBuffer();
-          mod = await WebAssembly.instantiate(buf, WASM_IMPORTS);
-        }
-      } catch (err) {
-        throw new Error("engine.wasm 加载失败: " + (err && err.message ? err.message : err));
-      }
-      try {
-        wasmEngine = mod.instance.exports;
-        wasmEngine.init(state.n);   // 轻量初始化（仅分配/生成内部表，无算杀）
-      } catch (err) {
-        wasmEngine = null;
-        throw new Error("WASM 初始化失败: " + (err && err.message ? err.message : err));
-      }
-      return wasmEngine;
-    })().catch(function (err) {
-      wasmLoading = null;
+  // 创建 Worker 并后台加载 WASM（全程异步，主线程永不阻塞；
+  // 任何失败仅回退 JS 引擎，绝不允许引发崩溃/ANR）
+  function loadWasmWorker() {
+    if (wasmWorker || wasmError || wasmLoading) return;
+    wasmLoading = true;
+    let wk = null;
+    try {
+      if (typeof Worker === "undefined") throw new Error("Web Worker 不可用");
+      wk = new Worker("engine.worker.js");
+    } catch (err) {
+      wasmLoading = false;
       wasmError = true;
-      try { statusText.textContent = "引擎加载失败，已回退轻量引擎"; } catch (e) {}
-      throw err;
-    });
-    return wasmLoading;
+      return;
+    }
+    wasmWorker = wk;
+    wk.onmessage = function (e) {
+      const d = e && e.data;
+      if (!d) return;
+      if (d.type === "move") {
+        const cb = pendingMove;
+        pendingMove = null;
+        if (cb) {
+          if (d.r >= 0 && d.c >= 0) cb([d.r, d.c]);
+          else cb(null);
+        }
+      } else if (d.type === "load") {
+        wasmLoading = false;
+        if (d.ok) {
+          wasmWorkerReady = true;
+          try { statusText.textContent = "大师级引擎已就绪，黑方先行"; } catch (err) {}
+        } else {
+          wasmError = true;
+          wasmWorkerReady = false;
+          try {
+            if (wasmWorker) { wasmWorker.terminate(); }
+          } catch (err) {}
+          wasmWorker = null;
+          try { statusText.textContent = "引擎加载失败，已回退轻量引擎"; } catch (err) {}
+        }
+      }
+    };
+    wk.onerror = function () {
+      wasmLoading = false;
+      wasmError = true;
+      wasmWorkerReady = false;
+      try {
+        if (wasmWorker) { wasmWorker.terminate(); }
+      } catch (err) {}
+      wasmWorker = null;
+    };
+    try {
+      wk.postMessage({ id: ++moveSeq, type: "load" });
+    } catch (err) {
+      wasmError = true;
+      wasmWorker = null;
+    }
   }
 
   // WASM 预算：静态节点阶梯（墨案低配也可流畅运行）
@@ -994,35 +1007,28 @@
     return WASM_BUDGETS[state.difficulty] || 60000;
   }
 
-  // 同步当前棋盘到 WASM 引擎（init 同时完成规格同步与 Zobrist 初始化）
-  function wasmSyncBoard() {
-    const w = wasmEngine;
-    w.init(state.n);
-    for (let r = 0; r < state.n; r++) {
-      for (let c = 0; c < state.n; c++) {
-        const v = state.board[r][c];
-        if (v !== EMPTY) w.setCell(r, c, v);
+  // 异步 WASM 走棋：打包棋盘发给 Worker，结果回调 mv（[r,c] 或 null）
+  function wasmMoveAsync(me, callback) {
+    const n = state.n;
+    const flat = new Array(n * n);
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < n; c++) {
+        flat[r * n + c] = state.board[r][c];
       }
     }
-  }
-
-  // WASM 走棋：返回 [row,col] 或 null（非法/失败时回退原生引擎）
-  function wasmBestMove(me) {
+    pendingMove = callback;
     try {
-      wasmSyncBoard();
-      const w = wasmEngine;
-      w.think(me, wasmBudget());
-      const r = w.moveR(), c = w.moveC();
-      if (r < 0 || r >= state.n || c < 0 || c >= state.n) return null;
-      if (state.board[r][c] !== EMPTY) return null;
-      // 禁手模式下 WASM 着法需复核
-      if (state.renju && me === BLACK && isForbidden(state.board, state.n, r, c)) return null;
-      // 防守兜底（双保险）：JS 侧独立探测对手威胁，
-      // 若 WASM 着法未落在防守点上，强制替换为最优堵截点
-      const safe = jsDefenseCheck(me, [r, c]);
-      return safe;
+      wasmWorker.postMessage({
+        id: ++moveSeq,
+        type: "move",
+        n: n,
+        board: flat,
+        me: me,
+        budget: wasmBudget()
+      });
     } catch (err) {
-      return null;
+      pendingMove = null;
+      callback(null);
     }
   }
 
@@ -1030,7 +1036,7 @@
   function jsDefenseCheck(me, wasmMove) {
     const opp = me === BLACK ? WHITE : BLACK;
     const savedDeadline = AI.deadline, savedNodes = AI.nodes;
-    // 关键：同步 AI 引擎的棋盘引用（WASM 模式下 AI.board 可能残留旧棋盘）
+    // 关键：同步 AI 引擎的棋盘引用
     AI.board = state.board;
     AI.n = state.n;
     AI.me = me;
@@ -1125,23 +1131,45 @@
 
   function aiToMove() {
     if (state.over) return;
-    if (state.current === state.human) return;
+    if (state.current === state.human) return;   // 轮到人类时 AI 不动
     const me = state.current;
-    let mv = null;
+    const plyAtThink = state.moves.length;
 
-    // 统一大师级 WASM 引擎；未就绪/异常/禁手非法时回退 JS 轻量引擎
-    if (wasmEngine) {
-      mv = wasmBestMove(me);
-      if (!mv) mv = AI.bestMove(state.board, state.n, me, state.renju, null);
+    // 落子回调：校验局面未变（防新开/悔棋期间返回）
+    function finish(mv) {
+      if (state.over || state.current !== me || state.moves.length !== plyAtThink) return;
+      if (mv && (mv[0] < 0 || mv[0] >= state.n || mv[1] < 0 || mv[1] >= state.n || state.board[mv[0]][mv[1]] !== EMPTY)) {
+        mv = null;
+      }
+      if (!mv) {
+        mv = AI.bestMove(state.board, state.n, me, state.renju, null);
+      }
+      if (mv && (mv[0] < 0 || mv[0] >= state.n || mv[1] < 0 || mv[1] >= state.n || state.board[mv[0]][mv[1]] !== EMPTY)) {
+        mv = AI.findEmptyFallback();
+      }
+      if (!state.over && state.current === me && state.moves.length === plyAtThink) {
+        makeMove(mv[0], mv[1]);
+      }
+    }
+
+    if (wasmWorkerReady) {
+      // 大师级 WASM 引擎（Worker 内异步思考，主线程零阻塞）
+      wasmMoveAsync(me, function (mv) {
+        if (mv) {
+          // 禁手/越界复核 + 防守兜底
+          if (state.renju && me === BLACK && isForbidden(state.board, state.n, mv[0], mv[1])) {
+            finish(null);
+            return;
+          }
+          finish(jsDefenseCheck(me, mv));
+        } else {
+          finish(null);
+        }
+      });
     } else {
-      mv = AI.bestMove(state.board, state.n, me, state.renju, null);
-    }
-
-    if (mv && (mv[0] < 0 || mv[0] >= state.n || mv[1] < 0 || mv[1] >= state.n || state.board[mv[0]][mv[1]] !== EMPTY)) {
-      mv = AI.findEmptyFallback();
-    }
-    if (!state.over && state.current === me) {
-      makeMove(mv[0], mv[1]);
+      // 引擎未就绪：首次走棋时触发后台加载（不阻塞），本步 JS 引擎兜底
+      if (!wasmWorker && !wasmError) loadWasmWorker();
+      finish(AI.bestMove(state.board, state.n, me, state.renju, null));
     }
   }
 
@@ -1471,21 +1499,6 @@
     draw();
   }
 
-  // 空闲时异步预加载大师级 WASM 引擎（首屏渲染与输入响应优先；
-  // 加载全程异步无同步算杀，不影响任何交互）
-  if (typeof WebAssembly !== "undefined") {
-    var idleFn = function () {
-      loadWasmEngine().then(function () {
-        try { statusText.textContent = "大师级引擎已就绪，黑方先行"; } catch (e) {}
-      }).catch(function () {});
-    };
-    if (typeof requestIdleCallback === "function") {
-      requestIdleCallback(idleFn, { timeout: 2000 });
-    } else {
-      setTimeout(idleFn, 800);
-    }
-  }
-
   // 供自动化测试导出的内部逻辑（仅测试环境使用，不影响生产）
   if (typeof globalThis !== "undefined" && globalThis.__GOMOKU_TEST__) {
     globalThis.__GOMOKU_API__ = {
@@ -1493,7 +1506,7 @@
       state, draw, makeMove, newGame, aiToMove, undo,
       getPos, findWinningLine,
       classifyPointAt, isDoubleThreat, threatValue, AI,
-      loadWasmEngine, wasmBestMove, wasmBudget, wasmEngine,
+      loadWasmWorker, wasmMoveAsync, wasmBudget, jsDefenseCheck,
       set setState(o) { Object.assign(state, o); },
       getStatus() { return state; }
     };
