@@ -73,8 +73,6 @@
     } catch (e) {}
     const grid = size / (n - 1);
     const margin = grid / 2;
-    const minXY = margin;
-    const maxXY = size - margin;      // 最外层网格交点坐标（绘制硬边界）
 
     // 背景
     ctx.fillStyle = "#f2ecd8";
@@ -135,20 +133,31 @@
       ctx.fill();
     }
 
-    // 胜局高亮：仅沿成五的 5 颗棋子中心绘制一条加粗贯穿线，端点严格钳制在网格交点内
-    if (state.over && state.winning && state.winning.length) {
+    // 胜局高亮：仅沿成五的 5 颗棋子中心绘制一条加粗贯穿线。
+    // 绘制前硬校验：每颗坐标界内且棋盘上确为同色；任一不满足则整线不画
+    // （杜绝把线画到棋盘外沿/伪端点，宁可无高亮也不画错）。
+    if (state.over && state.winning && state.winning.length >= 2) {
       const cells = state.winning;
-      const cx0 = Math.min(maxXY, Math.max(minXY, margin + cells[0][1] * grid));
-      const cy0 = Math.min(maxXY, Math.max(minXY, margin + cells[0][0] * grid));
-      const cx1 = Math.min(maxXY, Math.max(minXY, margin + cells[cells.length - 1][1] * grid));
-      const cy1 = Math.min(maxXY, Math.max(minXY, margin + cells[cells.length - 1][0] * grid));
-      ctx.beginPath();
-      ctx.moveTo(cx0, cy0);
-      ctx.lineTo(cx1, cy1);
-      ctx.strokeStyle = "#000000";
-      ctx.lineWidth = Math.max(4, rStone * 0.35);
-      ctx.lineCap = "butt";
-      ctx.stroke();
+      let ok = true, lineColor = EMPTY;
+      for (let i = 0; i < cells.length; i++) {
+        const rr = cells[i][0], cc = cells[i][1];
+        if (rr < 0 || rr >= n || cc < 0 || cc >= n || state.board[rr][cc] === EMPTY) { ok = false; break; }
+        if (lineColor === EMPTY) lineColor = state.board[rr][cc];
+        else if (state.board[rr][cc] !== lineColor) { ok = false; break; }
+      }
+      if (ok) {
+        const cx0 = margin + cells[0][1] * grid;
+        const cy0 = margin + cells[0][0] * grid;
+        const cx1 = margin + cells[cells.length - 1][1] * grid;
+        const cy1 = margin + cells[cells.length - 1][0] * grid;
+        ctx.beginPath();
+        ctx.moveTo(cx0, cy0);
+        ctx.lineTo(cx1, cy1);
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = Math.max(4, rStone * 0.35);
+        ctx.lineCap = "butt";
+        ctx.stroke();
+      }
     }
   }
 
@@ -195,14 +204,21 @@
 
   /* ---------------- 规则 / 胜负 ---------------- */
 
-  // 计算单个方向连续长度
-  function lineLen(board, n, r, c, dr, dc, color) {
-    let len = 1;
+  // 沿方向 dr,dc 从 (r,c) 单向连续计数（不含起点）。
+  // 严格边界检查：遇棋盘边界/空位/异色立即终止，杜绝任何 wrap-around。
+  function countDir(board, n, r, c, dr, dc, color) {
+    let cnt = 0;
     let rr = r + dr, cc = c + dc;
-    while (rr >= 0 && rr < n && cc >= 0 && cc < n && board[rr][cc] === color) { len++; rr += dr; cc += dc; }
-    rr = r - dr; cc = c - dc;
-    while (rr >= 0 && rr < n && cc >= 0 && cc < n && board[rr][cc] === color) { len++; rr -= dr; cc -= dc; }
-    return len;
+    while (rr >= 0 && rr < n && cc >= 0 && cc < n && board[rr][cc] === color) {
+      cnt++;
+      rr += dr; cc += dc;
+    }
+    return cnt;
+  }
+
+  // 计算单个方向连续长度（起点 + 正负两向，中心不重复累加）
+  function lineLen(board, n, r, c, dr, dc, color) {
+    return 1 + countDir(board, n, r, c, dr, dc, color) + countDir(board, n, r, c, -dr, -dc, color);
   }
 
   // 在 (r,c) 落 color 子是否会直接赢
@@ -280,6 +296,7 @@
 
   // 检测以 (r,c) 为落点、包含它的精确 5 颗连珠（用于胜局高亮）。
   // 返回 5 颗棋子的坐标数组 [[r,c],...]；若连长 >5（长连）则取包含 (r,c) 的连续 5 颗。
+  // 硬校验：5 颗坐标必须全部界内且棋盘上确为该色，否则返回 null（宁可不画也不画错）。
   function findWinningLine(board, n, r, c) {
     const color = board[r][c];
     if (color === EMPTY) return null;
@@ -287,23 +304,26 @@
       const dr = DIRS[k][0], dc = DIRS[k][1];
       const len = lineLen(board, n, r, c, dr, dc, color);
       if (len < 5) continue;
-      // 找连续段起点（沿负方向）
+      // 找连续段起点（沿负方向回退，严格边界检查）
       let sr = r, sc = c;
       while (sr - dr >= 0 && sr - dr < n && sc - dc >= 0 && sc - dc < n &&
              board[sr - dr][sc - dc] === color) {
         sr -= dr; sc -= dc;
       }
       // 连续段为 [sr,sc] 起的 len 颗，取包含 (r,c) 的 5 颗（长连时尽量以 (r,c) 居中）
-      let idx = (dr !== 0) ? (r - sr) / Math.abs(dr) : (c - sc) / Math.abs(dc);
+      const idx = (dr !== 0) ? (r - sr) : (c - sc);
       let start = Math.max(0, idx - 2);
       if (start > len - 5) start = len - 5;
       const cells = [];
       let rr = sr + start * dr, cc = sc + start * dc;
+      let ok = true;
       for (let i = 0; i < 5; i++) {
+        // 逐颗校验界内 + 同色（杜绝越界坐标进入连线）
+        if (rr < 0 || rr >= n || cc < 0 || cc >= n || board[rr][cc] !== color) { ok = false; break; }
         cells.push([rr, cc]);
         rr += dr; cc += dc;
       }
-      return cells;
+      if (ok && cells.length === 5) return cells;
     }
     return null;
   }
@@ -1058,7 +1078,8 @@
       const oppT = AI.findOppThreat(opp);
       if (oppT) {
         const blk = AI.findBlockAgainst(oppT);
-        if (blk) {
+        if (blk && blk[0] >= 0 && blk[0] < state.n && blk[1] >= 0 && blk[1] < state.n &&
+            state.board[blk[0]][blk[1]] === EMPTY) {
           // 禁手模式下堵截点也需复核
           if (!(state.renju && me === BLACK && isForbidden(state.board, state.n, blk[0], blk[1]))) {
             result = blk;
@@ -1102,6 +1123,9 @@
   }
 
   function makeMove(row, col) {
+    // 入口硬防御：坐标越界或落子点非空一律拒绝（杜绝任何非法落子进入胜负判定）
+    if (row < 0 || row >= state.n || col < 0 || col >= state.n) return;
+    if (state.board[row][col] !== EMPTY) return;
     const color = state.current;
     state.board[row][col] = color;
     state.moves.push([row, col]);
